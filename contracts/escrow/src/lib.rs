@@ -25,6 +25,19 @@ const MIN_TIMELOCK_DELAY: u64 = 3_600;
 const DEFAULT_TIMELOCK_DELAY: u64 = 3_600;
 const OPERATION_EXPIRY: u64 = 2_592_000;
 
+// ── Storage cost management (issue #15) ──────────────────────────────────────
+// The storage-deposit model is opt-in: both rates default to 0 (disabled), so
+// the contract behaves exactly as before until the admin enables it via the
+// timelock. Once a rate is configured, `post_job` collects a refundable storage
+// deposit from the client, each non-terminal state transition deducts a small
+// non-refundable TTL-bump fee from that deposit, and the remainder is refunded
+// to the original payer when the job reaches a terminal state.
+const DEFAULT_STORAGE_DEPOSIT_RATE: i128 = 0;
+const DEFAULT_TTL_BUMP_FEE: i128 = 0;
+// Upper bounds so a mis-configured timelock op cannot make jobs un-postable.
+const MAX_STORAGE_DEPOSIT_RATE: i128 = 1_000_000_000; // 100 units @ 7 d.p.
+const MAX_TTL_BUMP_FEE: i128 = 100_000_000; // 10 units @ 7 d.p.
+
 #[contracttype]
 #[derive(Clone)]
 pub enum AdminOperation {
@@ -36,6 +49,9 @@ pub enum AdminOperation {
     RemoveAllowedToken(Address),
     WithdrawFees(Address),
     UpdateTimelockDelay(u64),
+    // Storage cost management (issue #15)
+    SetStorageDepositRate(i128),
+    SetTtlBumpFee(i128),
 }
 
 #[contracttype]
@@ -118,6 +134,11 @@ pub enum DataKey {
     ProposalsCount,
     Proposal(u64),
     TimelockDelay,
+    // Storage cost management (issue #15)
+    JobStorageDeposit(u64),
+    StorageDepositRate,
+    TtlBumpFee,
+    TotalStorageDeposits,
 }
 
 #[contracterror]
@@ -232,6 +253,20 @@ impl EscrowContract {
             revision_count: 0,
         };
 
+        // Collect a refundable storage deposit (issue #15). Disabled (0) by
+        // default; the admin enables it via the timelock. The deposit is held
+        // separately from the escrowed amount and refunded on terminal states.
+        let storage_deposit = calculate_storage_cost(&e, &job);
+        if storage_deposit > 0 {
+            token_client.transfer(&client, &e.current_contract_address(), &storage_deposit);
+            set_job_storage_deposit(&e, job_id, storage_deposit);
+            add_total_storage_deposits(&e, storage_deposit);
+            e.events().publish(
+                (Symbol::new(&e, "storage_deposit_collected"),),
+                (job_id, client.clone(), storage_deposit),
+            );
+        }
+
         set_job(&e, job_id, &job);
         bump_instance_ttl(&e);
 
@@ -264,6 +299,7 @@ impl EscrowContract {
         job.status = JobStatus::InProgress;
         set_job(&e, job_id, &job);
         bump_instance_ttl(&e);
+        charge_ttl_bump_fee(&e, job_id, &job.token);
 
         e.events()
             .publish((Symbol::new(&e, "job_accepted"),), (job_id, freelancer));
@@ -286,6 +322,7 @@ impl EscrowContract {
         job.status = JobStatus::SubmittedForReview;
         set_job(&e, job_id, &job);
         bump_instance_ttl(&e);
+        charge_ttl_bump_fee(&e, job_id, &job.token);
 
         e.events()
             .publish((Symbol::new(&e, "job_submitted"),), (job_id, freelancer));
@@ -323,6 +360,9 @@ impl EscrowContract {
         let token_client = token::Client::new(&e, &job.token);
         token_client.transfer(&e.current_contract_address(), &freelancer, &payout);
 
+        // Refund the remaining storage deposit to the original payer (issue #15).
+        refund_storage_deposit(&e, job_id, &job.token, &job.client);
+
         e.events().publish(
             (Symbol::new(&e, "job_approved"),),
             (job_id, client, freelancer, payout),
@@ -347,6 +387,7 @@ impl EscrowContract {
         job.revision_count += 1;
         set_job(&e, job_id, &job);
         bump_instance_ttl(&e);
+        charge_ttl_bump_fee(&e, job_id, &job.token);
 
         e.events().publish(
             (Symbol::new(&e, "job_rejected"),),
@@ -371,6 +412,9 @@ impl EscrowContract {
 
         let token_client = token::Client::new(&e, &job.token);
         token_client.transfer(&e.current_contract_address(), &client, &job.amount);
+
+        // Refund the remaining storage deposit to the original payer (issue #15).
+        refund_storage_deposit(&e, job_id, &job.token, &job.client);
 
         e.events()
             .publish((Symbol::new(&e, "job_cancelled"),), (job_id, client));
@@ -399,6 +443,9 @@ impl EscrowContract {
 
         let token_client = token::Client::new(&e, &job.token);
         token_client.transfer(&e.current_contract_address(), &client, &job.amount);
+
+        // Refund the remaining storage deposit to the original payer (issue #15).
+        refund_storage_deposit(&e, job_id, &job.token, &job.client);
 
         e.events()
             .publish((Symbol::new(&e, "deadline_enforced"),), (job_id, client));
@@ -445,6 +492,9 @@ impl EscrowContract {
             );
         }
 
+        // Refund the remaining storage deposit to the original payer (issue #15).
+        refund_storage_deposit(&e, job_id, &job.token, &job.client);
+
         e.events().publish(
             (Symbol::new(&e, "job_mutually_cancelled"),),
             (job_id, client, freelancer, client_share, freelancer_share),
@@ -459,6 +509,7 @@ impl EscrowContract {
         }
         bump_job_ttl(&e, job_id, &job);
         bump_instance_ttl(&e);
+        charge_ttl_bump_fee(&e, job_id, &job.token);
     }
 
     pub fn raise_dispute(
@@ -590,6 +641,9 @@ impl EscrowContract {
                 token_client.transfer(&e.current_contract_address(), &freelancer, &freelancer_net);
             }
         }
+
+        // Refund the remaining storage deposit to the original payer (issue #15).
+        refund_storage_deposit(&e, job_id, &job.token, &job.client);
 
         e.events().publish(
             (Symbol::new(&e, "dispute_resolved"),),
@@ -917,6 +971,34 @@ impl EscrowContract {
     pub fn get_proposals_count(e: Env) -> u64 {
         get_proposals_count_storage(&e)
     }
+
+    // ── Storage cost management views (issue #15) ───────────────────────────
+
+    /// Current per-job storage deposit rate (0 = deposits disabled).
+    pub fn get_storage_deposit_rate(e: Env) -> i128 {
+        get_storage_deposit_rate_storage(&e)
+    }
+
+    /// Current non-refundable TTL-bump fee deducted per state transition.
+    pub fn get_ttl_bump_fee(e: Env) -> i128 {
+        get_ttl_bump_fee_storage(&e)
+    }
+
+    /// Total refundable storage deposits currently held by the contract,
+    /// summed across all jobs. Admin/observability view.
+    pub fn get_total_storage_deposits(e: Env) -> i128 {
+        get_total_storage_deposits_storage(&e)
+    }
+
+    /// Remaining refundable storage deposit held for a specific job.
+    pub fn get_job_storage_deposit(e: Env, job_id: u64) -> i128 {
+        get_job_storage_deposit_storage(&e, job_id)
+    }
+
+    /// The storage deposit a new job would require at the current rate.
+    pub fn quote_storage_deposit(e: Env) -> i128 {
+        get_storage_deposit_rate_storage(&e)
+    }
 }
 
 fn is_active_job_status(status: &JobStatus) -> bool {
@@ -1070,6 +1152,118 @@ fn get_token_fees(e: &Env, token: &Address) -> i128 {
         .unwrap_or(0)
 }
 
+// ── Storage cost management helpers (issue #15) ──────────────────────────────
+
+fn get_storage_deposit_rate_storage(e: &Env) -> i128 {
+    e.storage()
+        .instance()
+        .get::<DataKey, i128>(&DataKey::StorageDepositRate)
+        .unwrap_or(DEFAULT_STORAGE_DEPOSIT_RATE)
+}
+
+fn get_ttl_bump_fee_storage(e: &Env) -> i128 {
+    e.storage()
+        .instance()
+        .get::<DataKey, i128>(&DataKey::TtlBumpFee)
+        .unwrap_or(DEFAULT_TTL_BUMP_FEE)
+}
+
+fn get_total_storage_deposits_storage(e: &Env) -> i128 {
+    e.storage()
+        .instance()
+        .get::<DataKey, i128>(&DataKey::TotalStorageDeposits)
+        .unwrap_or(0)
+}
+
+fn get_job_storage_deposit_storage(e: &Env, job_id: u64) -> i128 {
+    e.storage()
+        .persistent()
+        .get::<DataKey, i128>(&DataKey::JobStorageDeposit(job_id))
+        .unwrap_or(0)
+}
+
+/// Storage deposit required for a job. The Job entry has a fixed serialized
+/// size, so the deposit is a flat amount governed by the admin-configured rate
+/// (which is meant to be calibrated to cover the entry's expected-lifetime TTL
+/// bumps). Returns 0 when the feature is disabled.
+fn calculate_storage_cost(e: &Env, _job: &Job) -> i128 {
+    get_storage_deposit_rate_storage(e)
+}
+
+fn set_job_storage_deposit(e: &Env, job_id: u64, amount: i128) {
+    let key = DataKey::JobStorageDeposit(job_id);
+    if amount > 0 {
+        e.storage().persistent().set(&key, &amount);
+        e.storage().persistent().extend_ttl(
+            &key,
+            ACTIVE_JOB_LIFETIME_THRESHOLD,
+            ACTIVE_JOB_BUMP_AMOUNT,
+        );
+    } else {
+        e.storage().persistent().remove(&key);
+    }
+}
+
+fn add_total_storage_deposits(e: &Env, delta: i128) {
+    let total = get_total_storage_deposits_storage(e);
+    let updated = checked_add(e, total, delta);
+    e.storage()
+        .instance()
+        .set(&DataKey::TotalStorageDeposits, &updated);
+}
+
+/// Deduct a non-refundable TTL-bump fee from a job's storage deposit (capped at
+/// the remaining deposit) and move it into the withdrawable token-fee pool.
+/// No-op when the deposit feature is disabled or the deposit is exhausted.
+fn charge_ttl_bump_fee(e: &Env, job_id: u64, token: &Address) {
+    let fee_rate = get_ttl_bump_fee_storage(e);
+    if fee_rate <= 0 {
+        return;
+    }
+    let remaining = get_job_storage_deposit_storage(e, job_id);
+    if remaining <= 0 {
+        return;
+    }
+    let fee = if fee_rate > remaining {
+        remaining
+    } else {
+        fee_rate
+    };
+
+    set_job_storage_deposit(e, job_id, remaining - fee);
+
+    let current_fees = get_token_fees(e, token);
+    let updated_fees = checked_add(e, current_fees, fee);
+    e.storage()
+        .persistent()
+        .set(&DataKey::TokenFees(token.clone()), &updated_fees);
+    bump_token_fees_ttl(e, token);
+
+    add_total_storage_deposits(e, -fee);
+
+    e.events()
+        .publish((Symbol::new(e, "storage_fee_charged"),), (job_id, fee));
+}
+
+/// Refund a job's remaining storage deposit to the original payer when the job
+/// reaches a terminal state. No-op when there is nothing to refund.
+fn refund_storage_deposit(e: &Env, job_id: u64, token: &Address, payer: &Address) {
+    let remaining = get_job_storage_deposit_storage(e, job_id);
+    if remaining <= 0 {
+        return;
+    }
+    set_job_storage_deposit(e, job_id, 0);
+    add_total_storage_deposits(e, -remaining);
+
+    let token_client = token::Client::new(e, token);
+    token_client.transfer(&e.current_contract_address(), payer, &remaining);
+
+    e.events().publish(
+        (Symbol::new(e, "storage_deposit_refunded"),),
+        (job_id, payer.clone(), remaining),
+    );
+}
+
 fn next_proposal_id(e: &Env) -> u64 {
     let count = get_proposals_count_storage(e);
     let next = count + 1;
@@ -1167,6 +1361,24 @@ fn apply_operation(e: &Env, operation: &AdminOperation) {
             e.storage().instance().set(&DataKey::TimelockDelay, &delay);
             e.events()
                 .publish((Symbol::new(e, "delay_updated"),), (delay,));
+        }
+        AdminOperation::SetStorageDepositRate(rate) => {
+            let r = *rate;
+            if r < 0 || r > MAX_STORAGE_DEPOSIT_RATE {
+                panic_with_error!(e, Error::InvalidAmount);
+            }
+            e.storage().instance().set(&DataKey::StorageDepositRate, &r);
+            e.events()
+                .publish((Symbol::new(e, "storage_deposit_rate_updated"),), (r,));
+        }
+        AdminOperation::SetTtlBumpFee(fee) => {
+            let f = *fee;
+            if f < 0 || f > MAX_TTL_BUMP_FEE {
+                panic_with_error!(e, Error::InvalidAmount);
+            }
+            e.storage().instance().set(&DataKey::TtlBumpFee, &f);
+            e.events()
+                .publish((Symbol::new(e, "ttl_bump_fee_updated"),), (f,));
         }
     }
 }
@@ -6334,5 +6546,220 @@ mod test {
     fn get_nonexistent_operation_fails() {
         let (_, client, _, _, _, _) = setup();
         client.get_operation(&999u64);
+    }
+
+    // ── Storage cost management (issue #15) ──────────────────────────────────
+
+    /// Enable the storage-deposit model by configuring the rate and TTL-bump fee
+    /// through the timelock (proposing both, then executing after the delay).
+    fn enable_storage_deposits(
+        env: &Env,
+        client: &EscrowContractClient<'_>,
+        admin: &Address,
+        rate: i128,
+        ttl_fee: i128,
+    ) {
+        let op_rate = client.propose_operation(admin, &AdminOperation::SetStorageDepositRate(rate));
+        let op_fee = client.propose_operation(admin, &AdminOperation::SetTtlBumpFee(ttl_fee));
+        env.ledger().with_mut(|li| {
+            li.timestamp = 1_710_000_000 + DEFAULT_TIMELOCK_DELAY + 1;
+        });
+        client.execute_operation(&op_rate);
+        client.execute_operation(&op_fee);
+    }
+
+    #[test]
+    fn storage_deposit_disabled_by_default() {
+        let (env, client, _, user, _, native_token) = setup();
+        assert_eq!(client.get_storage_deposit_rate(), 0);
+        assert_eq!(client.get_ttl_bump_fee(), 0);
+
+        let token_client = token::Client::new(&env, &native_token);
+        let pre = token_client.balance(&user);
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
+
+        // No deposit collected — behaviour identical to before the feature.
+        assert_eq!(token_client.balance(&user), pre - 1_000_000);
+        assert_eq!(client.get_job_storage_deposit(&job_id), 0);
+        assert_eq!(client.get_total_storage_deposits(), 0);
+    }
+
+    #[test]
+    fn post_job_collects_storage_deposit_when_enabled() {
+        let (env, client, admin, user, _, native_token) = setup();
+        enable_storage_deposits(&env, &client, &admin, 100_000i128, 0i128);
+        assert_eq!(client.get_storage_deposit_rate(), 100_000);
+        assert_eq!(client.quote_storage_deposit(), 100_000);
+
+        let token_client = token::Client::new(&env, &native_token);
+        let contract_address = client.address.clone();
+        let pre_user = token_client.balance(&user);
+        let pre_contract = token_client.balance(&contract_address);
+
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
+
+        // Client pays amount + deposit; contract holds both.
+        assert_eq!(token_client.balance(&user), pre_user - 1_100_000);
+        assert_eq!(
+            token_client.balance(&contract_address),
+            pre_contract + 1_100_000
+        );
+        assert_eq!(client.get_job_storage_deposit(&job_id), 100_000);
+        assert_eq!(client.get_total_storage_deposits(), 100_000);
+        // The escrowed job amount itself is unchanged.
+        assert_eq!(client.get_job(&job_id).amount, 1_000_000);
+    }
+
+    #[test]
+    fn cancel_refunds_full_storage_deposit() {
+        let (env, client, admin, user, _, native_token) = setup();
+        enable_storage_deposits(&env, &client, &admin, 100_000i128, 0i128);
+
+        let token_client = token::Client::new(&env, &native_token);
+        let pre = token_client.balance(&user);
+
+        let job_id = client.post_job(
+            &user,
+            &500_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
+        client.cancel_job(&user, &job_id);
+
+        // Full refund: escrowed amount + storage deposit (no TTL fees consumed
+        // because the job never transitioned through an intermediate state).
+        assert_eq!(token_client.balance(&user), pre);
+        assert_eq!(client.get_job_storage_deposit(&job_id), 0);
+        assert_eq!(client.get_total_storage_deposits(), 0);
+    }
+
+    #[test]
+    fn approve_refunds_deposit_minus_ttl_fees() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        enable_storage_deposits(&env, &client, &admin, 100_000i128, 10_000i128);
+
+        let token_client = token::Client::new(&env, &native_token);
+        let pre_user = token_client.balance(&user);
+        let pre_freelancer = token_client.balance(&freelancer);
+
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
+        client.accept_job(&freelancer, &job_id); // -10_000 from deposit
+        client.submit_work(&freelancer, &job_id); // -10_000 from deposit
+        assert_eq!(client.get_job_storage_deposit(&job_id), 80_000);
+
+        client.approve_work(&user, &job_id); // refunds remaining 80_000
+
+        // Freelancer receives payout net of the 2.5% job fee.
+        assert_eq!(token_client.balance(&freelancer) - pre_freelancer, 975_000);
+        // Fee pool = 25_000 job fee + 20_000 TTL-bump fees.
+        assert_eq!(client.get_fees(&native_token), 45_000);
+        // Client paid 1_000_000 + 100_000, got 80_000 back → net -1_020_000.
+        assert_eq!(token_client.balance(&user), pre_user - 1_020_000);
+        assert_eq!(client.get_job_storage_deposit(&job_id), 0);
+        assert_eq!(client.get_total_storage_deposits(), 0);
+    }
+
+    #[test]
+    fn ttl_fee_is_capped_at_remaining_deposit() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        // Deposit smaller than two full bump fees so the second charge is capped.
+        enable_storage_deposits(&env, &client, &admin, 15_000i128, 10_000i128);
+
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
+        client.accept_job(&freelancer, &job_id); // 15_000 -> 5_000
+        assert_eq!(client.get_job_storage_deposit(&job_id), 5_000);
+        client.submit_work(&freelancer, &job_id); // capped: 5_000 -> 0
+        assert_eq!(client.get_job_storage_deposit(&job_id), 0);
+        // All 15_000 moved to fees; total deposits never went negative.
+        assert_eq!(client.get_fees(&native_token), 15_000);
+        assert_eq!(client.get_total_storage_deposits(), 0);
+
+        // Terminal state with an exhausted deposit refunds nothing and succeeds.
+        client.approve_work(&user, &job_id);
+        assert_eq!(client.get_job(&job_id).status, JobStatus::Completed);
+    }
+
+    #[test]
+    fn mutual_cancel_refunds_remaining_deposit() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        enable_storage_deposits(&env, &client, &admin, 100_000i128, 10_000i128);
+
+        let token_client = token::Client::new(&env, &native_token);
+        let pre_user = token_client.balance(&user);
+
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
+        client.accept_job(&freelancer, &job_id); // deposit 100_000 -> 90_000
+                                                 // 100% back to client; freelancer share 0.
+        client.mutual_cancel(&user, &freelancer, &job_id, &BPS_DENOMINATOR);
+
+        // Client gets the full escrow back + the remaining 90_000 deposit;
+        // only the single 10_000 TTL fee was consumed.
+        assert_eq!(token_client.balance(&user), pre_user - 10_000);
+        assert_eq!(client.get_job_storage_deposit(&job_id), 0);
+        assert_eq!(client.get_total_storage_deposits(), 0);
+        assert_eq!(client.get_fees(&native_token), 10_000);
+    }
+
+    #[test]
+    fn admin_configures_storage_rates_via_timelock() {
+        let (env, client, admin, _, _, _) = setup();
+        assert_eq!(client.get_storage_deposit_rate(), 0);
+        assert_eq!(client.get_ttl_bump_fee(), 0);
+
+        enable_storage_deposits(&env, &client, &admin, 50_000i128, 2_000i128);
+
+        assert_eq!(client.get_storage_deposit_rate(), 50_000);
+        assert_eq!(client.get_ttl_bump_fee(), 2_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #11)")]
+    fn set_storage_deposit_rate_above_max_fails() {
+        let (env, client, admin, _, _, _) = setup();
+        let op_id = client.propose_operation(
+            &admin,
+            &AdminOperation::SetStorageDepositRate(MAX_STORAGE_DEPOSIT_RATE + 1),
+        );
+        env.ledger().with_mut(|li| {
+            li.timestamp = 1_710_000_000 + DEFAULT_TIMELOCK_DELAY + 1;
+        });
+        client.execute_operation(&op_id);
     }
 }

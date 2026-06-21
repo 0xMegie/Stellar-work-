@@ -32,7 +32,9 @@ export type AdminOperationTag =
   | "AddAllowedToken"
   | "RemoveAllowedToken"
   | "WithdrawFees"
-  | "UpdateTimelockDelay";
+  | "UpdateTimelockDelay"
+  | "SetStorageDepositRate"
+  | "SetTtlBumpFee";
 
 export interface TimelockedOperation {
   proposer: string;

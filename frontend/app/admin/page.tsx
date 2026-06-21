@@ -40,6 +40,8 @@ const OPERATION_LABELS: Record<AdminOperationTag, string> = {
   RemoveAllowedToken: "Remove Allowed Token",
   WithdrawFees: "Withdraw Fees",
   UpdateTimelockDelay: "Update Timelock Delay",
+  SetStorageDepositRate: "Set Storage Deposit Rate (stroops)",
+  SetTtlBumpFee: "Set TTL Bump Fee (stroops)",
 };
 
 const OPERATION_TAGS = Object.keys(OPERATION_LABELS) as AdminOperationTag[];
@@ -515,6 +517,8 @@ export default function AdminPage() {
                   {selectedTag === "RemoveAllowedToken" && "Token contract address (C…)"}
                   {selectedTag === "WithdrawFees" && "Token contract address (C…)"}
                   {selectedTag === "UpdateTimelockDelay" && "New delay in seconds (≥ 3 600)"}
+                  {selectedTag === "SetStorageDepositRate" && "Per-job storage deposit in stroops (0 disables)"}
+                  {selectedTag === "SetTtlBumpFee" && "TTL-bump fee per transition in stroops (0 disables)"}
                 </label>
                 <input
                   id="op-value"
@@ -525,6 +529,8 @@ export default function AdminPage() {
                     selectedTag === "UpdateFeeBps" ? "250"
                     : selectedTag === "UpdateTimelockDelay" ? "7200"
                     : selectedTag === "TransferAdmin" ? "G..."
+                    : selectedTag === "SetStorageDepositRate" ? "100000"
+                    : selectedTag === "SetTtlBumpFee" ? "10000"
                     : "C..."
                   }
                   className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400"

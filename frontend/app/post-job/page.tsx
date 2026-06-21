@@ -1,6 +1,6 @@
 "use client";
 
-import { getDescPayloadMax, postJob } from "@/lib/contract";
+import { getDescPayloadMax, postJob, quoteStorageDeposit } from "@/lib/contract";
 import ErrorBanner from "@/components/ErrorBanner";
 import { getExplorerTxUrl } from "@/lib/stellar";
 import { useWallet } from "@/lib/wallet-context";
@@ -28,6 +28,7 @@ export default function PostJobPage() {
   const [txHash, setTxHash] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [maxDescPayloadBytes, setMaxDescPayloadBytes] = useState(4096);
+  const [storageDepositStroops, setStorageDepositStroops] = useState(0);
   const [fieldErrors, setFieldErrors] = useState<{
     amount?: string;
     description?: string;
@@ -64,6 +65,19 @@ export default function PostJobPage() {
         // Keep default when contract read is unavailable.
       });
   }, []);
+
+  // Storage deposit collected on top of the escrowed amount (issue #15).
+  // 0 when the admin has not enabled the deposit model.
+  useEffect(() => {
+    void quoteStorageDeposit()
+      .then((stroops) => setStorageDepositStroops(stroops))
+      .catch(() => {
+        // Keep 0 (deposit display hidden) when the read is unavailable.
+      });
+  }, []);
+
+  const formatXlm = (stroops: number): string =>
+    (stroops / 10_000_000).toLocaleString(undefined, { maximumFractionDigits: 7 });
 
   return (
     <section className="mx-auto max-w-2xl space-y-6">
@@ -273,6 +287,34 @@ export default function PostJobPage() {
             </p>
           )}
         </label>
+
+        {storageDepositStroops > 0 && (
+          <div
+            className="rounded-md border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700"
+            aria-live="polite"
+          >
+            <p className="font-medium">Refundable storage deposit</p>
+            <p className="mt-1">
+              An extra{" "}
+              <span className="font-mono">{formatXlm(storageDepositStroops)} XLM</span>{" "}
+              storage deposit is collected on top of the amount and refunded when
+              the job completes or is cancelled (minus any TTL-bump fees).
+            </p>
+            {(() => {
+              const stroops = parseAmountToStroops(amount);
+              if (!stroops) return null;
+              const total = BigInt(stroops) + BigInt(storageDepositStroops);
+              return (
+                <p className="mt-1">
+                  Total required from wallet:{" "}
+                  <span className="font-mono">
+                    {formatXlm(Number(total))} XLM
+                  </span>
+                </p>
+              );
+            })()}
+          </div>
+        )}
 
         <button
           type="submit"

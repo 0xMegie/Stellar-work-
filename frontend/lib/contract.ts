@@ -26,6 +26,16 @@ export function requireContractId(): string {
   return contractId;
 }
 
+/**
+ * Post a new job.
+ *
+ * Note (issue #15): when the admin has enabled the storage-deposit model, the
+ * contract also pulls a refundable storage deposit from the client on top of
+ * `amount`. The connected wallet must therefore hold `amount + storageDeposit`.
+ * Use {@link quoteStorageDeposit} to show the deposit before submitting; it is
+ * refunded (minus any consumed TTL-bump fees) when the job reaches a terminal
+ * state. The deposit is calculated on-chain, so no extra argument is required.
+ */
 export async function postJob(
   client: string,
   amount: string,
@@ -222,6 +232,63 @@ export async function getJobCount(): Promise<number> {
   return Number(response.data ?? 0);
 }
 
+// ── Storage cost management (issue #15) ────────────────────────────────────────
+
+/** Per-job storage deposit rate in stroops. 0 means deposits are disabled. */
+export async function getStorageDepositRate(): Promise<number> {
+  const response = await callContract(
+    requireContractId(),
+    "get_storage_deposit_rate",
+    [],
+    { readOnly: true },
+  );
+  return Number(response.data ?? 0);
+}
+
+/** Storage deposit (in stroops) a new job would require at the current rate. */
+export async function quoteStorageDeposit(): Promise<number> {
+  const response = await callContract(
+    requireContractId(),
+    "quote_storage_deposit",
+    [],
+    { readOnly: true },
+  );
+  return Number(response.data ?? 0);
+}
+
+/** Non-refundable TTL-bump fee (stroops) deducted per state transition. */
+export async function getTtlBumpFee(): Promise<number> {
+  const response = await callContract(
+    requireContractId(),
+    "get_ttl_bump_fee",
+    [],
+    { readOnly: true },
+  );
+  return Number(response.data ?? 0);
+}
+
+/** Total refundable storage deposits (stroops) currently held by the contract. */
+export async function getTotalStorageDeposits(): Promise<number> {
+  const response = await callContract(
+    requireContractId(),
+    "get_total_storage_deposits",
+    [],
+    { readOnly: true },
+  );
+  return Number(response.data ?? 0);
+}
+
+/** Remaining refundable storage deposit (stroops) held for a specific job. */
+export async function getJobStorageDeposit(jobId: string): Promise<number> {
+  const response = await callContract(
+    requireContractId(),
+    "get_job_storage_deposit",
+    [nativeToScVal(jobId, { type: "u64" })],
+    { readOnly: true },
+  );
+  return Number(response.data ?? 0);
+}
+
 // ── Timelocked governance ─────────────────────────────────────────────────────
 
 function encodeAdminOperation(tag: AdminOperationTag, value: unknown): xdr.ScVal {
@@ -242,6 +309,10 @@ function encodeAdminOperation(tag: AdminOperationTag, value: unknown): xdr.ScVal
       break;
     case "UpdateTimelockDelay":
       encodedValue = nativeToScVal(BigInt(value as string | number), { type: "u64" });
+      break;
+    case "SetStorageDepositRate":
+    case "SetTtlBumpFee":
+      encodedValue = nativeToScVal(BigInt(value as string | number), { type: "i128" });
       break;
     default:
       throw new Error(`Unknown AdminOperation tag: ${tag}`);

@@ -18,6 +18,44 @@ Location: `contracts/escrow/src/lib.rs`
 - `resolve_dispute(job_id, resolution)` — resolves a disputed job with basis-point split
 - `get_dispute_evidence(job_id)` — retrieves evidence for a disputed job
 
+## Storage Cost Management (issue #15)
+
+To keep the contract economically sustainable, jobs can carry a **refundable
+storage deposit** that covers their Soroban storage rent instead of the contract
+owner footing the bill.
+
+**The model is opt-in and disabled by default** (rate `0`), so the contract
+behaves exactly as before until an admin enables it via the timelock.
+
+- **Collection:** when the rate is non-zero, `post_job` pulls
+  `amount + storage_deposit` from the client. The deposit is held separately and
+  recorded per job (`JobStorageDeposit(job_id)`) and in a running
+  `TotalStorageDeposits` total.
+- **TTL-bump fee:** each non-terminal state transition (`accept_job`,
+  `submit_work`, `reject_work`, `extend_job_ttl`) deducts a small,
+  **non-refundable** TTL-bump fee from the job's deposit (capped at the remaining
+  deposit) and moves it into the withdrawable token-fee pool.
+- **Refund:** when a job reaches a terminal state (`approve_work`, `cancel_job`,
+  `enforce_deadline`, `mutual_cancel`, `resolve_dispute`) the **remaining
+  deposit is refunded to the original payer** (the client).
+- **Configuration via timelock:** the two rates are set through the existing
+  timelock governance — `AdminOperation::SetStorageDepositRate(i128)` and
+  `AdminOperation::SetTtlBumpFee(i128)` — bounded by `MAX_STORAGE_DEPOSIT_RATE`
+  and `MAX_TTL_BUMP_FEE`.
+
+### Views
+
+- `quote_storage_deposit() -> i128` — deposit a new job would require now.
+- `get_storage_deposit_rate() -> i128` / `get_ttl_bump_fee() -> i128` — current rates.
+- `get_job_storage_deposit(job_id) -> i128` — remaining deposit for a job.
+- `get_total_storage_deposits() -> i128` — total deposits held across all jobs.
+
+### Events
+
+- `storage_deposit_collected(job_id, client, amount)` on `post_job`.
+- `storage_fee_charged(job_id, fee)` on each TTL-bump fee deduction.
+- `storage_deposit_refunded(job_id, payer, amount)` on terminal refund.
+
 ## Data Model
 
 ### `Job` struct

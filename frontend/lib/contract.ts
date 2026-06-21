@@ -245,12 +245,27 @@ export async function getStorageDepositRate(): Promise<number> {
   return Number(response.data ?? 0);
 }
 
-/** Storage deposit (in stroops) a new job would require at the current rate. */
-export async function quoteStorageDeposit(): Promise<number> {
+/**
+ * Storage deposit (in stroops) a new job with the given `deadline` would
+ * require now. The deposit scales with the job's expected lifetime, so pass the
+ * job's deadline (Unix seconds, or "0" for no deadline) to get the real figure.
+ */
+export async function quoteStorageDeposit(deadline: string): Promise<number> {
   const response = await callContract(
     requireContractId(),
     "quote_storage_deposit",
-    [],
+    [nativeToScVal(deadline, { type: "u64" })],
+    { readOnly: true },
+  );
+  return Number(response.data ?? 0);
+}
+
+/** Total refundable storage deposits (stroops) a user has locked across jobs. */
+export async function getUserStorageDeposits(userAddress: string): Promise<number> {
+  const response = await callContract(
+    requireContractId(),
+    "get_user_storage_deposits",
+    [nativeToScVal(userAddress, { type: "address" })],
     { readOnly: true },
   );
   return Number(response.data ?? 0);

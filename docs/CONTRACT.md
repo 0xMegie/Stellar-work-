@@ -27,10 +27,16 @@ owner footing the bill.
 **The model is opt-in and disabled by default** (rate `0`), so the contract
 behaves exactly as before until an admin enables it via the timelock.
 
+- **Deposit sizing:** the deposit is **proportional to the job's expected
+  lifetime**. The `Job` entry is fixed-size, so the configured rate represents
+  the storage cost of one entry for a single ~30-day period; the deposit is then
+  `rate × periods`, where `periods` is the number of ~30-day periods until the
+  job's `deadline` (minimum 1, capped at `MAX_STORAGE_PERIODS`). A job with no
+  deadline is billed one base period.
 - **Collection:** when the rate is non-zero, `post_job` pulls
   `amount + storage_deposit` from the client. The deposit is held separately and
-  recorded per job (`JobStorageDeposit(job_id)`) and in a running
-  `TotalStorageDeposits` total.
+  recorded **per job** (`JobStorageDeposit(job_id)`), **per user**
+  (`UserStorageDeposit(address)`), and in a running `TotalStorageDeposits` total.
 - **TTL-bump fee:** each non-terminal state transition (`accept_job`,
   `submit_work`, `reject_work`, `extend_job_ttl`) deducts a small,
   **non-refundable** TTL-bump fee from the job's deposit (capped at the remaining
@@ -45,9 +51,11 @@ behaves exactly as before until an admin enables it via the timelock.
 
 ### Views
 
-- `quote_storage_deposit() -> i128` — deposit a new job would require now.
+- `quote_storage_deposit(deadline) -> i128` — actual deposit a new job with that
+  deadline would require now (rate × lifetime periods). Pass `0` for no deadline.
 - `get_storage_deposit_rate() -> i128` / `get_ttl_bump_fee() -> i128` — current rates.
 - `get_job_storage_deposit(job_id) -> i128` — remaining deposit for a job.
+- `get_user_storage_deposits(user) -> i128` — total deposits a user has locked.
 - `get_total_storage_deposits() -> i128` — total deposits held across all jobs.
 
 ### Events

@@ -67,14 +67,18 @@ export default function PostJobPage() {
   }, []);
 
   // Storage deposit collected on top of the escrowed amount (issue #15).
-  // 0 when the admin has not enabled the deposit model.
+  // It scales with the job's expected lifetime, so recompute whenever the
+  // deadline changes. 0 when the admin has not enabled the deposit model.
   useEffect(() => {
-    void quoteStorageDeposit()
+    const deadlineUnix = deadline
+      ? Math.floor(new Date(deadline).getTime() / 1000).toString()
+      : "0";
+    void quoteStorageDeposit(deadlineUnix)
       .then((stroops) => setStorageDepositStroops(stroops))
       .catch(() => {
         // Keep 0 (deposit display hidden) when the read is unavailable.
       });
-  }, []);
+  }, [deadline]);
 
   const formatXlm = (stroops: number): string =>
     (stroops / 10_000_000).toLocaleString(undefined, { maximumFractionDigits: 7 });

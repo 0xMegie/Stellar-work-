@@ -37,6 +37,12 @@ const DEFAULT_TTL_BUMP_FEE: i128 = 0;
 // Upper bounds so a mis-configured timelock op cannot make jobs un-postable.
 const MAX_STORAGE_DEPOSIT_RATE: i128 = 1_000_000_000; // 100 units @ 7 d.p.
 const MAX_TTL_BUMP_FEE: i128 = 100_000_000; // 10 units @ 7 d.p.
+                                            // The configured rate is the storage cost for one fixed-size `Job` entry over a
+                                            // single ~30-day lifetime period; the deposit scales by the number of periods a
+                                            // job is expected to live (derived from its deadline), capped so jobs with very
+                                            // distant deadlines cannot require an unbounded deposit.
+const STORAGE_DEPOSIT_PERIOD_SECS: u64 = 2_592_000; // 30 days
+const MAX_STORAGE_PERIODS: u64 = 60; // ~5 years
 
 #[contracttype]
 #[derive(Clone)]
@@ -136,6 +142,7 @@ pub enum DataKey {
     TimelockDelay,
     // Storage cost management (issue #15)
     JobStorageDeposit(u64),
+    UserStorageDeposit(Address),
     StorageDepositRate,
     TtlBumpFee,
     TotalStorageDeposits,
@@ -261,6 +268,7 @@ impl EscrowContract {
             token_client.transfer(&client, &e.current_contract_address(), &storage_deposit);
             set_job_storage_deposit(&e, job_id, storage_deposit);
             add_total_storage_deposits(&e, storage_deposit);
+            add_user_storage_deposits(&e, &client, storage_deposit);
             e.events().publish(
                 (Symbol::new(&e, "storage_deposit_collected"),),
                 (job_id, client.clone(), storage_deposit),
@@ -299,7 +307,7 @@ impl EscrowContract {
         job.status = JobStatus::InProgress;
         set_job(&e, job_id, &job);
         bump_instance_ttl(&e);
-        charge_ttl_bump_fee(&e, job_id, &job.token);
+        charge_ttl_bump_fee(&e, job_id, &job.token, &job.client);
 
         e.events()
             .publish((Symbol::new(&e, "job_accepted"),), (job_id, freelancer));
@@ -322,7 +330,7 @@ impl EscrowContract {
         job.status = JobStatus::SubmittedForReview;
         set_job(&e, job_id, &job);
         bump_instance_ttl(&e);
-        charge_ttl_bump_fee(&e, job_id, &job.token);
+        charge_ttl_bump_fee(&e, job_id, &job.token, &job.client);
 
         e.events()
             .publish((Symbol::new(&e, "job_submitted"),), (job_id, freelancer));
@@ -387,7 +395,7 @@ impl EscrowContract {
         job.revision_count += 1;
         set_job(&e, job_id, &job);
         bump_instance_ttl(&e);
-        charge_ttl_bump_fee(&e, job_id, &job.token);
+        charge_ttl_bump_fee(&e, job_id, &job.token, &job.client);
 
         e.events().publish(
             (Symbol::new(&e, "job_rejected"),),
@@ -509,7 +517,7 @@ impl EscrowContract {
         }
         bump_job_ttl(&e, job_id, &job);
         bump_instance_ttl(&e);
-        charge_ttl_bump_fee(&e, job_id, &job.token);
+        charge_ttl_bump_fee(&e, job_id, &job.token, &job.client);
     }
 
     pub fn raise_dispute(
@@ -995,9 +1003,17 @@ impl EscrowContract {
         get_job_storage_deposit_storage(&e, job_id)
     }
 
-    /// The storage deposit a new job would require at the current rate.
-    pub fn quote_storage_deposit(e: Env) -> i128 {
-        get_storage_deposit_rate_storage(&e)
+    /// Total refundable storage deposits a specific user currently has locked
+    /// across all of their active jobs.
+    pub fn get_user_storage_deposits(e: Env, user: Address) -> i128 {
+        get_user_storage_deposits_storage(&e, &user)
+    }
+
+    /// The actual storage deposit a new job with the given `deadline` would
+    /// require now — the per-period rate scaled by the job's expected lifetime.
+    /// Pass `0` for a job with no deadline (billed a single base period).
+    pub fn quote_storage_deposit(e: Env, deadline: u64) -> i128 {
+        storage_cost_for_deadline(&e, deadline)
     }
 }
 
@@ -1182,12 +1198,43 @@ fn get_job_storage_deposit_storage(e: &Env, job_id: u64) -> i128 {
         .unwrap_or(0)
 }
 
-/// Storage deposit required for a job. The Job entry has a fixed serialized
-/// size, so the deposit is a flat amount governed by the admin-configured rate
-/// (which is meant to be calibrated to cover the entry's expected-lifetime TTL
-/// bumps). Returns 0 when the feature is disabled.
-fn calculate_storage_cost(e: &Env, _job: &Job) -> i128 {
-    get_storage_deposit_rate_storage(e)
+fn get_user_storage_deposits_storage(e: &Env, user: &Address) -> i128 {
+    e.storage()
+        .persistent()
+        .get::<DataKey, i128>(&DataKey::UserStorageDeposit(user.clone()))
+        .unwrap_or(0)
+}
+
+/// Number of ~30-day lifetime periods a job is expected to occupy storage,
+/// derived from its deadline (minimum 1, capped at `MAX_STORAGE_PERIODS`).
+/// `deadline == 0` (no deadline) bills a single base period.
+fn storage_periods_for_deadline(e: &Env, deadline: u64) -> u64 {
+    let now = e.ledger().timestamp();
+    let lifetime = deadline.saturating_sub(now);
+    // Ceiling division so any partial period rounds up to a full one.
+    let periods =
+        lifetime.saturating_add(STORAGE_DEPOSIT_PERIOD_SECS - 1) / STORAGE_DEPOSIT_PERIOD_SECS;
+    periods.clamp(1, MAX_STORAGE_PERIODS)
+}
+
+/// Storage deposit required to keep a job's (fixed-size) `Job` entry alive.
+///
+/// The configured rate is the cost of one entry for one ~30-day period — i.e.
+/// it encodes the fixed serialized size of the `Job` struct. The deposit then
+/// scales by the job's expected lifetime (number of periods until its
+/// deadline), so longer-lived jobs fund proportionally more TTL bumps. Returns
+/// 0 when the feature is disabled.
+fn storage_cost_for_deadline(e: &Env, deadline: u64) -> i128 {
+    let rate = get_storage_deposit_rate_storage(e);
+    if rate <= 0 {
+        return 0;
+    }
+    let periods = storage_periods_for_deadline(e, deadline) as i128;
+    rate.saturating_mul(periods)
+}
+
+fn calculate_storage_cost(e: &Env, job: &Job) -> i128 {
+    storage_cost_for_deadline(e, job.deadline)
 }
 
 fn set_job_storage_deposit(e: &Env, job_id: u64, amount: i128) {
@@ -1212,10 +1259,27 @@ fn add_total_storage_deposits(e: &Env, delta: i128) {
         .set(&DataKey::TotalStorageDeposits, &updated);
 }
 
+/// Adjust the running per-user deposit total. The entry is removed once it
+/// returns to zero so we don't retain empty records.
+fn add_user_storage_deposits(e: &Env, user: &Address, delta: i128) {
+    let key = DataKey::UserStorageDeposit(user.clone());
+    let updated = checked_add(e, get_user_storage_deposits_storage(e, user), delta);
+    if updated > 0 {
+        e.storage().persistent().set(&key, &updated);
+        e.storage().persistent().extend_ttl(
+            &key,
+            ACTIVE_JOB_LIFETIME_THRESHOLD,
+            ACTIVE_JOB_BUMP_AMOUNT,
+        );
+    } else {
+        e.storage().persistent().remove(&key);
+    }
+}
+
 /// Deduct a non-refundable TTL-bump fee from a job's storage deposit (capped at
 /// the remaining deposit) and move it into the withdrawable token-fee pool.
 /// No-op when the deposit feature is disabled or the deposit is exhausted.
-fn charge_ttl_bump_fee(e: &Env, job_id: u64, token: &Address) {
+fn charge_ttl_bump_fee(e: &Env, job_id: u64, token: &Address, payer: &Address) {
     let fee_rate = get_ttl_bump_fee_storage(e);
     if fee_rate <= 0 {
         return;
@@ -1240,6 +1304,7 @@ fn charge_ttl_bump_fee(e: &Env, job_id: u64, token: &Address) {
     bump_token_fees_ttl(e, token);
 
     add_total_storage_deposits(e, -fee);
+    add_user_storage_deposits(e, payer, -fee);
 
     e.events()
         .publish((Symbol::new(e, "storage_fee_charged"),), (job_id, fee));
@@ -1254,6 +1319,7 @@ fn refund_storage_deposit(e: &Env, job_id: u64, token: &Address, payer: &Address
     }
     set_job_storage_deposit(e, job_id, 0);
     add_total_storage_deposits(e, -remaining);
+    add_user_storage_deposits(e, payer, -remaining);
 
     let token_client = token::Client::new(e, token);
     token_client.transfer(&e.current_contract_address(), payer, &remaining);
@@ -6596,7 +6662,8 @@ mod test {
         let (env, client, admin, user, _, native_token) = setup();
         enable_storage_deposits(&env, &client, &admin, 100_000i128, 0i128);
         assert_eq!(client.get_storage_deposit_rate(), 100_000);
-        assert_eq!(client.quote_storage_deposit(), 100_000);
+        // No deadline → one base period.
+        assert_eq!(client.quote_storage_deposit(&0u64), 100_000);
 
         let token_client = token::Client::new(&env, &native_token);
         let contract_address = client.address.clone();
@@ -6761,5 +6828,103 @@ mod test {
             li.timestamp = 1_710_000_000 + DEFAULT_TIMELOCK_DELAY + 1;
         });
         client.execute_operation(&op_id);
+    }
+
+    #[test]
+    fn storage_deposit_scales_with_expected_lifetime() {
+        let (env, client, admin, user, _, native_token) = setup();
+        enable_storage_deposits(&env, &client, &admin, 100_000i128, 0i128);
+
+        // `enable_storage_deposits` advances the ledger to this timestamp.
+        let now = 1_710_000_000 + DEFAULT_TIMELOCK_DELAY + 1;
+
+        // A 90-day job spans 3 storage periods → 3× the per-period rate.
+        let deadline = now + 3 * STORAGE_DEPOSIT_PERIOD_SECS;
+        assert_eq!(client.quote_storage_deposit(&deadline), 300_000);
+
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &deadline,
+            &native_token,
+        );
+        // The collected deposit matches the quote and scales with the deadline.
+        assert_eq!(client.get_job_storage_deposit(&job_id), 300_000);
+
+        // A no-deadline job is billed a single base period.
+        let job_id2 = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
+        assert_eq!(client.get_job_storage_deposit(&job_id2), 100_000);
+        assert_eq!(client.quote_storage_deposit(&0u64), 100_000);
+    }
+
+    #[test]
+    fn user_storage_deposits_tracked_across_jobs() {
+        let (env, client, admin, user, _, native_token) = setup();
+        enable_storage_deposits(&env, &client, &admin, 100_000i128, 0i128);
+
+        assert_eq!(client.get_user_storage_deposits(&user), 0);
+
+        let job1 = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
+        let job2 = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
+
+        // Per-user total aggregates across the user's jobs.
+        assert_eq!(client.get_user_storage_deposits(&user), 200_000);
+        assert_eq!(client.get_total_storage_deposits(), 200_000);
+
+        client.cancel_job(&user, &job1);
+        assert_eq!(client.get_user_storage_deposits(&user), 100_000);
+
+        client.cancel_job(&user, &job2);
+        assert_eq!(client.get_user_storage_deposits(&user), 0);
+        assert_eq!(client.get_total_storage_deposits(), 0);
+    }
+
+    #[test]
+    fn user_storage_deposits_track_ttl_fees_and_refund() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        enable_storage_deposits(&env, &client, &admin, 100_000i128, 10_000i128);
+
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
+        assert_eq!(client.get_user_storage_deposits(&user), 100_000);
+
+        client.accept_job(&freelancer, &job_id); // -10_000 TTL fee
+        assert_eq!(client.get_user_storage_deposits(&user), 90_000);
+
+        client.submit_work(&freelancer, &job_id); // -10_000 TTL fee
+        assert_eq!(client.get_user_storage_deposits(&user), 80_000);
+
+        client.approve_work(&user, &job_id); // refunds remaining 80_000
+        assert_eq!(client.get_user_storage_deposits(&user), 0);
+        assert_eq!(client.get_total_storage_deposits(), 0);
     }
 }

@@ -1,0 +1,90 @@
+diff --git a/contracts/escrow/src/lib.rs b/contracts/escrow/src/lib.rs
+--- a/contracts/escrow/src/lib.rs
++++ b/contracts/escrow/src/lib.rs
+@@
+     pub fn get_job(e: Env, job_id: u64) -> Job {
+-        get_job_or_panic(&e, job_id)
++        let job = get_job_or_panic(&e, job_id);
++        bump_job_ttl_if_present(&e, job_id, &job);
++        bump_instance_ttl(&e);
++        job
+     }
+@@
+         let mut cursor = start;
+         while cursor <= end {
+-            jobs.push_back(get_job_or_panic(&e, cursor));
++            let job = get_job_or_panic(&e, cursor);
++            bump_job_ttl_if_present(&e, cursor, &job);
++            jobs.push_back(job);
+             cursor = cursor.saturating_add(1);
+         }
++        bump_instance_ttl(&e);
+         jobs
+     }
+@@
+             if let Some(job) = e
+                 .storage()
+                 .persistent()
+                 .get::<DataKey, Job>(&DataKey::Job(i))
+             {
++                bump_job_ttl_if_present(&e, i, &job);
+                 if job.status == status {
+                     jobs.push_back(job);
+                 }
+             }
+@@
+     pub fn get_client_active_jobs_count(e: Env, client: Address) -> u32 {
+         count_client_active_jobs(&e, &client)
+     }
+@@
+     pub fn get_fees(e: Env, token: Address) -> i128 {
+         get_token_fees(&e, &token)
+     }
+@@
+ fn count_client_active_jobs(e: &Env, client: &Address) -> u32 {
+@@
+         if let Some(job) = e
+             .storage()
+             .persistent()
+             .get::<DataKey, Job>(&DataKey::Job(i))
+         {
++            bump_job_ttl_if_present(e, i, &job);
+             if &job.client == client && is_active_job_status(&job.status) {
+                 count = count.saturating_add(1);
+             }
+         }
+@@
+ fn bump_job_ttl(e: &Env, job_id: u64, job: &Job) {
+@@
+ }
++
++fn bump_job_ttl_if_present(e: &Env, job_id: u64, job: &Job) {
++    let key = DataKey::Job(job_id);
++    if e.storage().persistent().has(&key) {
++        bump_job_ttl(e, job_id, job);
++    }
++}
+@@
+         if let Some(job) = e
+             .storage()
+             .persistent()
+             .get::<DataKey, Job>(&DataKey::Job(i))
+         {
++            bump_job_ttl_if_present(e, i, &job);
+             if job.status == status {
+                 count += 1;
+             }
+         }
+@@
+ fn get_token_fees(e: &Env, token: &Address) -> i128 {
+-    e.storage()
+-        .persistent()
+-        .get::<DataKey, i128>(&DataKey::TokenFees(token.clone()))
+-        .unwrap_or(0)
++    let key = DataKey::TokenFees(token.clone());
++    let fees = e.storage().persistent().get::<DataKey, i128>(&key).unwrap_or(0);
++    if e.storage().persistent().has(&key) {
++        bump_token_fees_ttl(e, token);
++    }
++    fees
+ }

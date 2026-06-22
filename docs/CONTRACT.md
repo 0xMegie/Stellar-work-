@@ -117,3 +117,37 @@ behaves exactly as before until an admin enables it via the timelock.
 - `15` ActiveJobLimitExceeded
 - `16` RevisionLimitReached
 - `17` DescriptionPayloadTooLarge
+- `18` OperationNotFound
+- `19` OperationAlreadyExecuted
+- `20` OperationCancelled
+- `21` OperationNotReady
+- `22` OperationExpired
+- `23` DelayBelowMinimum
+- `24` ContractPaused
+
+## Circuit Breaker (Pause)
+
+The contract implements a standard DeFi circuit-breaker pattern. An admin can
+pause the contract to halt all non-essential state-mutating operations in the
+event of a discovered vulnerability.
+
+### State
+
+| State | Description |
+|-------|-------------|
+| `Active` | Normal operation — all functions available. |
+| `Paused` | Only admin operations, dispute resolution, and fund-recovery functions are permitted. |
+
+### Functions
+
+- `pause(e: Address)` — admin-only, sets state to `Paused`, emits `contract_paused` event.
+- `unpause(e: Address)` — admin-only, sets state to `Active`, emits `contract_unpaused` event.
+- `get_contract_state() -> ContractState` — view function returning current state.
+
+### Behaviour When Paused
+
+**Blocked (revert with `ContractPaused`):**
+`post_job`, `accept_job`, `submit_work`, `approve_work`, `reject_work`, `raise_dispute`, `extend_job_ttl`
+
+**Allowed (fund recovery / admin):**
+`cancel_job`, `enforce_deadline`, `mutual_cancel`, `resolve_dispute`, `withdraw_fees`, `pause`, `unpause`

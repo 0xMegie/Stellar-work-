@@ -124,6 +124,13 @@ pub struct DisputeEvidence {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContractState {
+    Active,
+    Paused,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     JobsCount,
@@ -146,6 +153,7 @@ pub enum DataKey {
     StorageDepositRate,
     TtlBumpFee,
     TotalStorageDeposits,
+    ContractState,
 }
 
 #[contracterror]
@@ -175,6 +183,7 @@ pub enum Error {
     OperationNotReady = 21,
     OperationExpired = 22,
     DelayBelowMinimum = 23,
+    ContractPaused = 24,
 }
 
 #[contract]
@@ -219,6 +228,7 @@ impl EscrowContract {
         deadline: u64,
         token: Address,
     ) -> u64 {
+        require_not_paused(&e);
         if amount <= 0 {
             panic_with_error!(&e, Error::InvalidAmount);
         }
@@ -287,6 +297,7 @@ impl EscrowContract {
     }
 
     pub fn accept_job(e: Env, freelancer: Address, job_id: u64) {
+        require_not_paused(&e);
         let mut job = get_job_or_panic(&e, job_id);
         freelancer.require_auth();
 
@@ -314,6 +325,7 @@ impl EscrowContract {
     }
 
     pub fn submit_work(e: Env, freelancer: Address, job_id: u64) {
+        require_not_paused(&e);
         let mut job = get_job_or_panic(&e, job_id);
         freelancer.require_auth();
 
@@ -337,6 +349,7 @@ impl EscrowContract {
     }
 
     pub fn approve_work(e: Env, client: Address, job_id: u64) {
+        require_not_paused(&e);
         let mut job = get_job_or_panic(&e, job_id);
         client.require_auth();
 
@@ -378,6 +391,7 @@ impl EscrowContract {
     }
 
     pub fn reject_work(e: Env, client: Address, job_id: u64) {
+        require_not_paused(&e);
         let mut job = get_job_or_panic(&e, job_id);
         client.require_auth();
 
@@ -510,6 +524,7 @@ impl EscrowContract {
     }
 
     pub fn extend_job_ttl(e: Env, caller: Address, job_id: u64) {
+        require_not_paused(&e);
         caller.require_auth();
         let job = get_job_or_panic(&e, job_id);
         if job.client != caller && job.freelancer != Option::Some(caller.clone()) {
@@ -527,6 +542,7 @@ impl EscrowContract {
         evidence_hash: Option<BytesN<32>>,
         reason_preview: Option<BytesN<64>>,
     ) {
+        require_not_paused(&e);
         let mut job = get_job_or_panic(&e, job_id);
         caller.require_auth();
 
@@ -781,6 +797,43 @@ impl EscrowContract {
         CONTRACT_VERSION
     }
 
+    // ── Pause / Unpause (circuit breaker) ─────────────────────────────────────
+
+    pub fn pause(e: Env, caller: Address) {
+        caller.require_auth();
+        let admin = load_admin(&e);
+        if caller != admin {
+            panic_with_error!(&e, Error::Unauthorized);
+        }
+        e.storage()
+            .instance()
+            .set(&DataKey::ContractState, &ContractState::Paused);
+        bump_instance_ttl(&e);
+        e.events()
+            .publish((Symbol::new(&e, "contract_paused"),), (caller,));
+    }
+
+    pub fn unpause(e: Env, caller: Address) {
+        caller.require_auth();
+        let admin = load_admin(&e);
+        if caller != admin {
+            panic_with_error!(&e, Error::Unauthorized);
+        }
+        e.storage()
+            .instance()
+            .set(&DataKey::ContractState, &ContractState::Active);
+        bump_instance_ttl(&e);
+        e.events()
+            .publish((Symbol::new(&e, "contract_unpaused"),), (caller,));
+    }
+
+    pub fn get_contract_state(e: Env) -> ContractState {
+        e.storage()
+            .instance()
+            .get::<DataKey, ContractState>(&DataKey::ContractState)
+            .unwrap_or(ContractState::Active)
+    }
+
     pub fn update_fee_bps(e: Env, caller: Address, new_fee_bps: i128) {
         caller.require_auth();
         let admin = load_admin(&e);
@@ -1014,6 +1067,14 @@ impl EscrowContract {
     /// Pass `0` for a job with no deadline (billed a single base period).
     pub fn quote_storage_deposit(e: Env, deadline: u64) -> i128 {
         storage_cost_for_deadline(&e, deadline)
+    }
+}
+
+fn require_not_paused(e: &Env) {
+    if e.storage().instance().get::<DataKey, ContractState>(&DataKey::ContractState)
+        == Some(ContractState::Paused)
+    {
+        panic_with_error!(e, Error::ContractPaused);
     }
 }
 
@@ -6926,5 +6987,242 @@ mod test {
         client.approve_work(&user, &job_id); // refunds remaining 80_000
         assert_eq!(client.get_user_storage_deposits(&user), 0);
         assert_eq!(client.get_total_storage_deposits(), 0);
+    }
+
+    // ── Circuit breaker: pause / unpause ─────────────────────────────────────
+
+    #[test]
+    fn contract_starts_active() {
+        let (_, client, _, _, _, _) = setup();
+        assert_eq!(client.get_contract_state(), ContractState::Active);
+    }
+
+    #[test]
+    fn admin_can_pause() {
+        let (env, client, admin, _, _, _) = setup();
+        client.pause(&admin);
+        assert_eq!(client.get_contract_state(), ContractState::Paused);
+    }
+
+    #[test]
+    fn admin_can_unpause() {
+        let (env, client, admin, _, _, _) = setup();
+        client.pause(&admin);
+        assert_eq!(client.get_contract_state(), ContractState::Paused);
+        client.unpause(&admin);
+        assert_eq!(client.get_contract_state(), ContractState::Active);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn pause_by_non_admin_fails() {
+        let (env, client, _, user, _, _) = setup();
+        client.pause(&user);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn unpause_by_non_admin_fails() {
+        let (env, client, admin, user, _, _) = setup();
+        client.pause(&admin);
+        client.unpause(&user);
+    }
+
+    #[test]
+    fn pause_emits_event() {
+        let (env, client, admin, _, _, _) = setup();
+        let events_before = env.events().all().len();
+        client.pause(&admin);
+        let events_after = env.events().all().len();
+        assert!(
+            events_after > events_before,
+            "contract_paused event must be emitted"
+        );
+    }
+
+    #[test]
+    fn unpause_emits_event() {
+        let (env, client, admin, _, _, _) = setup();
+        client.pause(&admin);
+        let events_before = env.events().all().len();
+        client.unpause(&admin);
+        let events_after = env.events().all().len();
+        assert!(
+            events_after > events_before,
+            "contract_unpaused event must be emitted"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #24)")]
+    fn post_job_paused_reverts() {
+        let (env, client, admin, user, _, native_token) = setup();
+        client.pause(&admin);
+        client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #24)")]
+    fn accept_job_paused_reverts() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        client.pause(&admin);
+        client.accept_job(&freelancer, &job_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #24)")]
+    fn submit_work_paused_reverts() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        client.accept_job(&freelancer, &job_id);
+        client.pause(&admin);
+        client.submit_work(&freelancer, &job_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #24)")]
+    fn approve_work_paused_reverts() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        client.accept_job(&freelancer, &job_id);
+        client.submit_work(&freelancer, &job_id);
+        client.pause(&admin);
+        client.approve_work(&user, &job_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #24)")]
+    fn reject_work_paused_reverts() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        client.accept_job(&freelancer, &job_id);
+        client.submit_work(&freelancer, &job_id);
+        client.pause(&admin);
+        client.reject_work(&user, &job_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #24)")]
+    fn raise_dispute_paused_reverts() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        client.accept_job(&freelancer, &job_id);
+        client.pause(&admin);
+        client.raise_dispute(&user, &job_id, &None, &None);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #24)")]
+    fn extend_job_ttl_paused_reverts() {
+        let (env, client, admin, user, _, native_token) = setup();
+        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        client.pause(&admin);
+        client.extend_job_ttl(&user, &job_id);
+    }
+
+    #[test]
+    fn cancel_job_works_while_paused() {
+        let (env, client, admin, user, _, native_token) = setup();
+        let token_client = token::Client::new(&env, &native_token);
+        let pre_balance = token_client.balance(&user);
+        let job_id = client.post_job(&user, &500_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        client.pause(&admin);
+        client.cancel_job(&user, &job_id);
+        assert_eq!(token_client.balance(&user), pre_balance);
+        assert_eq!(client.get_job(&job_id).status, JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn enforce_deadline_works_while_paused() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        let deadline = 1_710_000_000 + 3600;
+        let token_client = token::Client::new(&env, &native_token);
+        let pre_balance = token_client.balance(&user);
+        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &deadline, &native_token);
+        client.accept_job(&freelancer, &job_id);
+        client.pause(&admin);
+        env.ledger().with_mut(|li| {
+            li.timestamp = deadline + 1;
+        });
+        client.enforce_deadline(&user, &job_id);
+        assert_eq!(token_client.balance(&user), pre_balance);
+        assert_eq!(client.get_job(&job_id).status, JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn mutual_cancel_works_while_paused() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        let token_client = token::Client::new(&env, &native_token);
+        let user_pre = token_client.balance(&user);
+        let freelancer_pre = token_client.balance(&freelancer);
+        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        client.accept_job(&freelancer, &job_id);
+        client.pause(&admin);
+        client.mutual_cancel(&user, &freelancer, &job_id, &6_000i128);
+        // User gets back 600_000 of the 1_000_000 posted; net change = -400_000.
+        assert_eq!(token_client.balance(&user) - user_pre, -400_000);
+        assert_eq!(token_client.balance(&freelancer) - freelancer_pre, 400_000);
+        assert_eq!(client.get_job(&job_id).status, JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn resolve_dispute_works_while_paused() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        let token_client = token::Client::new(&env, &native_token);
+        let pre_balance = token_client.balance(&user);
+        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        client.accept_job(&freelancer, &job_id);
+        client.raise_dispute(&user, &job_id, &None, &None);
+        client.pause(&admin);
+        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 });
+        assert_eq!(token_client.balance(&user), pre_balance);
+        assert_eq!(client.get_job(&job_id).status, JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn withdraw_fees_works_while_paused() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        client.accept_job(&freelancer, &job_id);
+        client.submit_work(&freelancer, &job_id);
+        client.approve_work(&user, &job_id);
+        let token_client = token::Client::new(&env, &native_token);
+        let pre_balance = token_client.balance(&admin);
+        client.pause(&admin);
+        client.withdraw_fees(&native_token);
+        let post_balance = token_client.balance(&admin);
+        assert_eq!(post_balance - pre_balance, 25_000);
+        assert_eq!(client.get_fees(&native_token), 0);
+    }
+
+    #[test]
+    fn existing_tests_pass_with_pause_unpause_cycle() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        // Pause and unpause — the contract must behave normally after.
+        client.pause(&admin);
+        client.unpause(&admin);
+        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        client.accept_job(&freelancer, &job_id);
+        client.submit_work(&freelancer, &job_id);
+        client.approve_work(&user, &job_id);
+        assert_eq!(client.get_job(&job_id).status, JobStatus::Completed);
+        assert_eq!(client.get_fees(&native_token), 25_000);
+    }
+
+    #[test]
+    fn pause_is_idempotent() {
+        let (env, client, admin, _, _, _) = setup();
+        client.pause(&admin);
+        client.pause(&admin);
+        assert_eq!(client.get_contract_state(), ContractState::Paused);
+    }
+
+    #[test]
+    fn unpause_is_idempotent() {
+        let (env, client, admin, _, _, _) = setup();
+        client.unpause(&admin);
+        client.unpause(&admin);
+        assert_eq!(client.get_contract_state(), ContractState::Active);
     }
 }

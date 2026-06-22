@@ -1071,7 +1071,9 @@ impl EscrowContract {
 }
 
 fn require_not_paused(e: &Env) {
-    if e.storage().instance().get::<DataKey, ContractState>(&DataKey::ContractState)
+    if e.storage()
+        .instance()
+        .get::<DataKey, ContractState>(&DataKey::ContractState)
         == Some(ContractState::Paused)
     {
         panic_with_error!(e, Error::ContractPaused);
@@ -7058,14 +7060,28 @@ mod test {
     fn post_job_paused_reverts() {
         let (env, client, admin, user, _, native_token) = setup();
         client.pause(&admin);
-        client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
     }
 
     #[test]
     #[should_panic(expected = "Error(Contract, #24)")]
     fn accept_job_paused_reverts() {
         let (env, client, admin, user, freelancer, native_token) = setup();
-        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
         client.pause(&admin);
         client.accept_job(&freelancer, &job_id);
     }
@@ -7074,7 +7090,14 @@ mod test {
     #[should_panic(expected = "Error(Contract, #24)")]
     fn submit_work_paused_reverts() {
         let (env, client, admin, user, freelancer, native_token) = setup();
-        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
         client.accept_job(&freelancer, &job_id);
         client.pause(&admin);
         client.submit_work(&freelancer, &job_id);
@@ -7084,7 +7107,14 @@ mod test {
     #[should_panic(expected = "Error(Contract, #24)")]
     fn approve_work_paused_reverts() {
         let (env, client, admin, user, freelancer, native_token) = setup();
-        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
         client.pause(&admin);
@@ -7095,7 +7125,14 @@ mod test {
     #[should_panic(expected = "Error(Contract, #24)")]
     fn reject_work_paused_reverts() {
         let (env, client, admin, user, freelancer, native_token) = setup();
-        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
         client.pause(&admin);
@@ -7106,7 +7143,14 @@ mod test {
     #[should_panic(expected = "Error(Contract, #24)")]
     fn raise_dispute_paused_reverts() {
         let (env, client, admin, user, freelancer, native_token) = setup();
-        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
         client.accept_job(&freelancer, &job_id);
         client.pause(&admin);
         client.raise_dispute(&user, &job_id, &None, &None);
@@ -7116,7 +7160,14 @@ mod test {
     #[should_panic(expected = "Error(Contract, #24)")]
     fn extend_job_ttl_paused_reverts() {
         let (env, client, admin, user, _, native_token) = setup();
-        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
         client.pause(&admin);
         client.extend_job_ttl(&user, &job_id);
     }
@@ -7126,7 +7177,14 @@ mod test {
         let (env, client, admin, user, _, native_token) = setup();
         let token_client = token::Client::new(&env, &native_token);
         let pre_balance = token_client.balance(&user);
-        let job_id = client.post_job(&user, &500_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        let job_id = client.post_job(
+            &user,
+            &500_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
         client.pause(&admin);
         client.cancel_job(&user, &job_id);
         assert_eq!(token_client.balance(&user), pre_balance);
@@ -7139,7 +7197,14 @@ mod test {
         let deadline = 1_710_000_000 + 3600;
         let token_client = token::Client::new(&env, &native_token);
         let pre_balance = token_client.balance(&user);
-        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &deadline, &native_token);
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &deadline,
+            &native_token,
+        );
         client.accept_job(&freelancer, &job_id);
         client.pause(&admin);
         env.ledger().with_mut(|li| {
@@ -7156,7 +7221,14 @@ mod test {
         let token_client = token::Client::new(&env, &native_token);
         let user_pre = token_client.balance(&user);
         let freelancer_pre = token_client.balance(&freelancer);
-        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
         client.accept_job(&freelancer, &job_id);
         client.pause(&admin);
         client.mutual_cancel(&user, &freelancer, &job_id, &6_000i128);
@@ -7171,7 +7243,14 @@ mod test {
         let (env, client, admin, user, freelancer, native_token) = setup();
         let token_client = token::Client::new(&env, &native_token);
         let pre_balance = token_client.balance(&user);
-        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
         client.accept_job(&freelancer, &job_id);
         client.raise_dispute(&user, &job_id, &None, &None);
         client.pause(&admin);
@@ -7183,7 +7262,14 @@ mod test {
     #[test]
     fn withdraw_fees_works_while_paused() {
         let (env, client, admin, user, freelancer, native_token) = setup();
-        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
         client.approve_work(&user, &job_id);
@@ -7202,7 +7288,14 @@ mod test {
         // Pause and unpause — the contract must behave normally after.
         client.pause(&admin);
         client.unpause(&admin);
-        let job_id = client.post_job(&user, &1_000_000i128, &hash(&env), &32u32, &0u64, &native_token);
+        let job_id = client.post_job(
+            &user,
+            &1_000_000i128,
+            &hash(&env),
+            &32u32,
+            &0u64,
+            &native_token,
+        );
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
         client.approve_work(&user, &job_id);

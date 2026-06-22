@@ -211,7 +211,11 @@ export default function HomePage() {
     }
 
     return bookmarkedJobs.filter(({ id, job }) => {
-      const description = getDescription(job.description_hash).toLowerCase();
+      const description = (
+        descriptions[job.description_hash] ??
+        safeLocalStorageGet(`job-desc:${job.description_hash}`) ??
+        "Description unavailable (posted from another device)"
+      ).toLowerCase();
       const amount = toXlm(job.amount).toLowerCase();
       const freelancer = job.freelancer?.toLowerCase() ?? "";
       return [
@@ -223,7 +227,7 @@ export default function HomePage() {
         freelancer,
       ].some((value) => value.includes(normalizedSearchTerm));
     });
-  }, [bookmarkedIds, jobs, normalizedSearchTerm, showBookmarkedOnly]);
+  }, [bookmarkedIds, descriptions, jobs, normalizedSearchTerm, showBookmarkedOnly]);
 
   useEffect(() => {
     if (loading) return;

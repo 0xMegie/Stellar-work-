@@ -10,6 +10,7 @@ export interface Job {
   client: string;
   freelancer: string | null;
   amount: string;
+  /** SHA-256 hex digest of the job description text (IPFS multihash digest, backward-compatible). */
   description_hash: string;
   status: JobStatus;
   created_at: string;

@@ -16,6 +16,7 @@ import {
 } from "@/lib/recent-searches";
 import { getExplorerTxUrl } from "@/lib/stellar";
 import { getRecentJobIds, getJobWindowBounds } from "@/lib/recent-ids";
+import { resolveDescription, safeLocalStorageGet } from "@/lib/storage";
 import type { Job } from "@/lib/types";
 import { useWallet } from "@/lib/wallet-context";
 import Link from "next/link";
@@ -53,6 +54,9 @@ export default function HomePage() {
   const seenJobIdsRef = useRef<Set<number>>(new Set());
   const isInitialLoadRef = useRef(true);
   const [viewMode, setViewMode] = useState<JobsViewMode>("grid");
+  const [descriptions, setDescriptions] = useState<Record<string, string>>({});
+  const resolvingHashesRef = useRef<Set<string>>(new Set());
+  const pinataGateway = process.env.NEXT_PUBLIC_PINATA_GATEWAY;
 
   useEffect(() => {
     setViewMode(readViewMode());
@@ -176,6 +180,25 @@ export default function HomePage() {
     void refresh();
   }, [refresh]);
 
+  // Resolve descriptions for the current page of jobs.
+  // Uses localStorage first (instant), then IPFS gateway when configured.
+  useEffect(() => {
+    const hashes = [...new Set(jobs.map(({ job }) => job.description_hash))];
+    let mounted = true;
+    for (const hash of hashes) {
+      if (resolvingHashesRef.current.has(hash)) continue;
+      resolvingHashesRef.current.add(hash);
+      void resolveDescription(hash, pinataGateway).then((text) => {
+        if (mounted && text !== null) {
+          setDescriptions((prev) => ({ ...prev, [hash]: text }));
+        }
+      });
+    }
+    return () => {
+      mounted = false;
+    };
+  }, [jobs, pinataGateway]);
+
   const normalizedSearchTerm = searchTerm.trim().toLowerCase();
 
   const visibleJobs = useMemo(() => {
@@ -213,9 +236,10 @@ export default function HomePage() {
   }, [lastAnnouncedSignature, loading, normalizedSearchTerm, showBookmarkedOnly, visibleJobs]);
 
   function getDescription(hash: string): string {
-    const stored = localStorage.getItem(`job-desc:${hash}`);
-    if (stored) return stored;
-    return "Description unavailable (posted from another device)";
+    if (descriptions[hash]) return descriptions[hash];
+    // Synchronous localStorage fallback (covers the poster's own device instantly
+    // and existing jobs that pre-date the IPFS integration).
+    return safeLocalStorageGet(`job-desc:${hash}`) ?? "Description unavailable (posted from another device)";
   }
 
   function markJobViewed(id: number) {

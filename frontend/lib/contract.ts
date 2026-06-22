@@ -395,3 +395,27 @@ export async function getProposalsCount(): Promise<number> {
   );
   return Number(response.data ?? 0);
 }
+
+// ── Circuit breaker: pause / unpause ───────────────────────────────────────────
+
+export async function pauseContract(caller: string) {
+  return callContract(requireContractId(), "pause", [
+    nativeToScVal(caller, { type: "address" }),
+  ]);
+}
+
+export async function unpauseContract(caller: string) {
+  return callContract(requireContractId(), "unpause", [
+    nativeToScVal(caller, { type: "address" }),
+  ]);
+}
+
+export async function getContractState(): Promise<string> {
+  const response = await callContract(
+    requireContractId(),
+    "get_contract_state",
+    [],
+    { readOnly: true },
+  );
+  return String(response.data ?? "Active");
+}

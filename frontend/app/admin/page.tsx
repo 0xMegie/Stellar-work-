@@ -10,6 +10,9 @@ import {
   getOperation,
   getProposalsCount,
   getTimelockDelay,
+  getContractState,
+  pauseContract,
+  unpauseContract,
   proposeOperation,
   withdrawFees,
 } from "@/lib/contract";
@@ -85,6 +88,9 @@ export default function AdminPage() {
   const [error, setError] = useState<string | null>(null);
   const [withdrawing, setWithdrawing] = useState(false);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [contractState, setContractState] = useState<string>("Active");
+  const [pausing, setPausing] = useState(false);
+  const [unpausing, setUnpausing] = useState(false);
 
   // Governance state
   const [timelockDelay, setTimelockDelay] = useState<number>(3600);
@@ -103,6 +109,9 @@ export default function AdminPage() {
     setError(null);
     setSuccessMessage(null);
     try {
+      const state = await getContractState();
+      setContractState(state);
+
       const token = await getNativeToken();
       setNativeToken(token);
 
@@ -191,6 +200,50 @@ export default function AdminPage() {
       }
     } finally {
       setWithdrawing(false);
+    }
+  };
+
+  const handlePause = async () => {
+    if (!wallet) return;
+    setPausing(true);
+    setError(null);
+    setSuccessMessage(null);
+    try {
+      await pauseContract(wallet);
+      setContractState("Paused");
+      setSuccessMessage("Contract paused. Only fund recovery and admin operations are allowed.");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Pause failed.";
+      if (msg.includes("Unauthorized") || msg.includes("#2")) {
+        setIsAdmin(false);
+        setError("Unauthorized: your wallet is not the contract admin.");
+      } else {
+        setError(msg);
+      }
+    } finally {
+      setPausing(false);
+    }
+  };
+
+  const handleUnpause = async () => {
+    if (!wallet) return;
+    setUnpausing(true);
+    setError(null);
+    setSuccessMessage(null);
+    try {
+      await unpauseContract(wallet);
+      setContractState("Active");
+      setSuccessMessage("Contract unpaused. Normal operation resumed.");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Unpause failed.";
+      if (msg.includes("Unauthorized") || msg.includes("#2")) {
+        setIsAdmin(false);
+        setError("Unauthorized: your wallet is not the contract admin.");
+      } else {
+        setError(msg);
+      }
+    } finally {
+      setUnpausing(false);
     }
   };
 
@@ -338,6 +391,41 @@ export default function AdminPage() {
               {successMessage}
             </p>
           )}
+
+          <SectionCard title="Circuit Breaker">
+            <div className="mt-2 flex items-center gap-4">
+              <div>
+                <p className="text-xs text-slate-500">Contract State</p>
+                <p
+                  className={`text-lg font-bold ${
+                    contractState === "Paused" ? "text-red-600" : "text-green-600"
+                  }`}
+                >
+                  {contractState}
+                </p>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  disabled={pausing || contractState === "Paused" || !isAdmin}
+                  onClick={handlePause}
+                  className="rounded-md bg-red-700 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {pausing ? "Pausing..." : "Pause"}
+                </button>
+                <button
+                  disabled={unpausing || contractState === "Active" || !isAdmin}
+                  onClick={handleUnpause}
+                  className="rounded-md bg-green-700 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {unpausing ? "Unpausing..." : "Unpause"}
+                </button>
+              </div>
+            </div>
+            <p className="mt-2 text-xs text-slate-400">
+              When paused, only fund-recovery (cancel, enforce deadline, mutual cancel),
+              dispute resolution, and admin operations are permitted.
+            </p>
+          </SectionCard>
 
           <SectionCard title="Platform Fees">
             <p className="mt-2 flex min-w-0 items-baseline gap-2 text-3xl font-bold">

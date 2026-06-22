@@ -8,6 +8,7 @@ import StatusPill from "@/components/StatusPill";
 import { acceptJob, approveWork, cancelJob, getJob, submitWork } from "@/lib/contract";
 import { formatDeadline, toXlm } from "@/lib/format";
 import { getExplorerTxUrl } from "@/lib/stellar";
+import { resolveDescription } from "@/lib/storage";
 import type { Job } from "@/lib/types";
 import { useWallet } from "@/lib/wallet-context";
 import Link from "next/link";
@@ -20,6 +21,7 @@ export default function JobDetailPage() {
   const { wallet } = useWallet();
   const { showSuccess, showError } = useToast();
   const [job, setJob] = useState<Job | null>(null);
+  const [description, setDescription] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
@@ -28,6 +30,7 @@ export default function JobDetailPage() {
   const [invalidId, setInvalidId] = useState(false);
   const [copied, setCopied] = useState(false);
   const copyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pinataGateway = process.env.NEXT_PUBLIC_PINATA_GATEWAY;
 
   const numericId = Number(id);
   const isIdValid = !isNaN(numericId) && numericId > 0 && Number.isInteger(numericId);
@@ -58,6 +61,24 @@ export default function JobDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
+  // Resolve description independently so the job card shows immediately while
+  // IPFS fetching (if needed) completes in the background.
+  useEffect(() => {
+    if (!job) {
+      setDescription(null);
+      return;
+    }
+    let cancelled = false;
+    void resolveDescription(job.description_hash, pinataGateway).then((text) => {
+      if (!cancelled) {
+        setDescription(text ?? 'Description unavailable (posted from another device)');
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [job, pinataGateway]);
+
   useEffect(() => {
     if (!wallet) {
       setError(null);
@@ -81,12 +102,6 @@ export default function JobDetailPage() {
   const canApprove = Boolean(isClient && job?.status === "SubmittedForReview");
   const canCancel = Boolean(isClient && job?.status === "Open");
   const hasPrimaryActions = canAccept || canSubmit || canApprove || canCancel;
-
-  function getDescription(hash: string): string {
-    const stored = localStorage.getItem(`job-desc:${hash}`);
-    if (stored) return stored;
-    return "Description unavailable (posted from another device)";
-  }
 
   async function handleAction(
     action: () => Promise<{ hash?: string }>,
@@ -234,7 +249,8 @@ export default function JobDetailPage() {
           <strong>Amount:</strong> {toXlm(job.amount)} XLM
         </p>
         <p>
-          <strong>Description:</strong> {getDescription(job.description_hash)}
+          <strong>Description:</strong>{" "}
+          {description !== null ? description : <em className="text-slate-400">Loading description…</em>}
         </p>
         <div className="flex flex-wrap items-center gap-2">
           <p className="flex items-center gap-2">

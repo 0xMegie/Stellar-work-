@@ -3,6 +3,7 @@
 import { getDescPayloadMax, postJob, quoteStorageDeposit } from "@/lib/contract";
 import ErrorBanner from "@/components/ErrorBanner";
 import { getExplorerTxUrl } from "@/lib/stellar";
+import { cacheDescription, uploadToIpfs } from "@/lib/storage";
 import { useWallet } from "@/lib/wallet-context";
 import { useEffect, useState } from "react";
 
@@ -151,7 +152,25 @@ export default function PostJobPage() {
               ? Math.floor(new Date(deadline).getTime() / 1000).toString()
               : "0";
 
-            localStorage.setItem(`job-desc:${hashHex}`, trimmedDescription);
+            // Upload description to IPFS before the contract transaction (fail-fast).
+            // When NEXT_PUBLIC_PINATA_JWT is not configured (e.g. dev / test), we fall
+            // back to localStorage-only storage, which preserves backward compatibility.
+            const pinataJwt = process.env.NEXT_PUBLIC_PINATA_JWT;
+            let ipfsCid: string | null = null;
+            if (pinataJwt) {
+              try {
+                ipfsCid = await uploadToIpfs(trimmedDescription, { pinataJwt });
+              } catch (e) {
+                throw new Error(
+                  `Failed to upload description to IPFS: ${e instanceof Error ? e.message : String(e)}`,
+                );
+              }
+            }
+
+            // Cache locally (text + CID). cacheDescription wraps setItem in
+            // try/catch, so Safari private-browsing mode cannot crash the page.
+            cacheDescription(hashHex, trimmedDescription, ipfsCid ?? '');
+
             const result = await postJob(
               wallet,
               amountStroops!,

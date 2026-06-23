@@ -21,6 +21,7 @@ import { useToast } from "@/components/ToastProvider";
 import { formatDeadline, toXlm } from "@/lib/format";
 import { useWallet } from "@/lib/wallet-context";
 import type { Job, JobStatus } from "@/lib/types";
+import { resolveJobDescriptions } from "@/lib/resolver";
 import { useEffect, useState, useCallback, useRef, type KeyboardEvent } from "react";
 
 const STATUS_OPTIONS: JobStatus[] = [
@@ -50,6 +51,8 @@ export default function DashboardPage() {
   const [actionLoading, setActionLoading] = useState<number | null>(null);
   const [pendingCancelJobId, setPendingCancelJobId] = useState<number | null>(null);
   const [completedJobsCount, setCompletedJobsCount] = useState<number | null>(null);
+  const [descriptions, setDescriptions] = useState<Record<string, string>>({});
+  const pinataGateway = process.env.NEXT_PUBLIC_PINATA_GATEWAY;
   const filterOptions: Array<JobStatus | "All"> = ["All", ...STATUS_OPTIONS];
   const filterButtonRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
@@ -90,6 +93,22 @@ export default function DashboardPage() {
       setError(null);
     }
   }, [wallet, fetchJobs]);
+
+  // Resolve descriptions for all loaded jobs whenever the job list changes.
+  useEffect(() => {
+    if (allJobs.length === 0) return;
+    const hashes = allJobs.map(({ job }) => job.description_hash);
+    let mounted = true;
+    void resolveJobDescriptions(hashes, pinataGateway).then((resolved) => {
+      if (!mounted) return;
+      const next: Record<string, string> = {};
+      for (const [hash, result] of resolved) {
+        next[hash] = result.text;
+      }
+      setDescriptions(next);
+    });
+    return () => { mounted = false; };
+  }, [allJobs, pinataGateway]);
 
   const handleAction = async (
     fn: () => Promise<unknown>,
@@ -245,6 +264,7 @@ export default function DashboardPage() {
             wallet={wallet}
             role="client"
             actionLoading={actionLoading}
+            descriptions={descriptions}
             onAction={handleAction}
             onRequestCancel={setPendingCancelJobId}
             onClearFilter={() => setStatusFilter("All")}
@@ -258,6 +278,7 @@ export default function DashboardPage() {
             wallet={wallet}
             role="freelancer"
             actionLoading={actionLoading}
+            descriptions={descriptions}
             onAction={handleAction}
             onRequestCancel={setPendingCancelJobId}
             onClearFilter={() => setStatusFilter("All")}
@@ -288,6 +309,7 @@ function JobSection({
   wallet,
   role,
   actionLoading,
+  descriptions,
   onAction,
   onRequestCancel,
   onClearFilter,
@@ -300,6 +322,7 @@ function JobSection({
   wallet: string;
   role: "client" | "freelancer";
   actionLoading: number | null;
+  descriptions: Record<string, string>;
   onAction: (fn: () => Promise<unknown>, jobId: number) => Promise<void>;
   onRequestCancel: (jobId: number) => void;
   onClearFilter: () => void;
@@ -332,6 +355,7 @@ function JobSection({
                 wallet={wallet}
                 role={role}
                 isLoading={actionLoading === id}
+                description={descriptions[job.description_hash]}
                 onAction={onAction}
                 onRequestCancel={onRequestCancel}
               />
@@ -349,6 +373,7 @@ function JobCard({
   wallet,
   role,
   isLoading,
+  description,
   onAction,
   onRequestCancel,
 }: {
@@ -357,6 +382,7 @@ function JobCard({
   wallet: string;
   role: "client" | "freelancer";
   isLoading: boolean;
+  description?: string;
   onAction: (fn: () => Promise<unknown>, jobId: number) => Promise<void>;
   onRequestCancel: (jobId: number) => void;
 }) {
@@ -375,6 +401,11 @@ function JobCard({
           </span>
           <span className="shrink-0">XLM</span>
         </p>
+        {description !== undefined ? (
+          <p className="line-clamp-2 text-slate-700">{description}</p>
+        ) : (
+          <p className="italic text-slate-400">Loading description…</p>
+        )}
         <p>
           {(() => {
             const deadline = formatDeadline(job.deadline);

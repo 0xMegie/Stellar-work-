@@ -887,14 +887,16 @@ impl EscrowContract {
         if fees <= 0 {
             return;
         }
-        e.storage()
-            .persistent()
-            .set(&DataKey::TokenFees(token.clone()), &0i128);
+
         bump_token_fees_ttl(&e, &token);
         bump_instance_ttl(&e);
 
         let token_client = token::Client::new(&e, &token);
         token_client.transfer(&e.current_contract_address(), &admin, &fees);
+
+        e.storage()
+            .persistent()
+            .set(&DataKey::TokenFees(token.clone()), &0i128);
 
         e.events()
             .publish((Symbol::new(&e, "fees_withdrawn"),), (token, fees));

@@ -1673,10 +1673,8 @@ fn apply_operation(e: &Env, operation: &AdminOperation) {
             e.storage()
                 .instance()
                 .set(&DataKey::DisputeResolverThreshold, &t);
-            e.events().publish(
-                (Symbol::new(e, "dispute_resolver_threshold_updated"),),
-                (t,),
-            );
+            e.events()
+                .publish((Symbol::new(e, "resolver_threshold_updated"),), (t,));
         }
     }
 }
@@ -1728,6 +1726,14 @@ mod test {
             .register_stellar_asset_contract_v2(native_token_admin.clone())
             .address();
         client.initialize(&admin, &native_token);
+
+        // Bootstrap a 2-member dispute resolution committee (issue #14) so the
+        // default 2-of-N threshold is satisfiable. Tests fetch the members via
+        // `client.get_dispute_resolvers()` and pass them as `resolve_dispute`
+        // signers.
+        let resolver1 = Address::generate(&env);
+        let resolver2 = Address::generate(&env);
+        client.configure_dispute_resolvers(&admin, &Vec::from_array(&env, [resolver1, resolver2]));
 
         let user = Address::generate(&env);
         let freelancer = Address::generate(&env);
@@ -2524,7 +2530,11 @@ mod test {
         assert_eq!(client.get_job(&job_id).status, JobStatus::Disputed);
 
         // client_bps = 10_000 → full refund to client
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 10_000 },
+            &client.get_dispute_resolvers(),
+        );
         let post_balance = token_client.balance(&user);
         assert_eq!(post_balance, pre_balance);
         assert_eq!(client.get_job(&job_id).status, JobStatus::Cancelled);
@@ -2549,7 +2559,11 @@ mod test {
         let pre_balance = token_client.balance(&freelancer);
 
         // client_bps = 0 → full payout to freelancer minus fee
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 0 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 0 },
+            &client.get_dispute_resolvers(),
+        );
 
         let post_balance = token_client.balance(&freelancer);
         assert_eq!(post_balance - pre_balance, 975_000);
@@ -2570,7 +2584,11 @@ mod test {
         );
         client.accept_job(&freelancer, &job_id);
         client.raise_dispute(&freelancer, &job_id, &None, &None);
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 10_000 },
+            &client.get_dispute_resolvers(),
+        );
 
         let events = env.events().all();
         assert!(events.len() >= 4);
@@ -2782,7 +2800,11 @@ mod test {
         let freelancer_pre = token_client.balance(&freelancer);
 
         // 50 / 50 split: client_bps = 5_000
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 5_000 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 5_000 },
+            &client.get_dispute_resolvers(),
+        );
 
         // client gets 500_000 (no fee on client portion)
         assert_eq!(token_client.balance(&user) - client_pre, 500_000);
@@ -2812,7 +2834,11 @@ mod test {
         let freelancer_pre = token_client.balance(&freelancer);
 
         // client gets 30%, freelancer gets 70% minus fee
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 3_000 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 3_000 },
+            &client.get_dispute_resolvers(),
+        );
 
         // client share = 300_000
         assert_eq!(token_client.balance(&user) - client_pre, 300_000);
@@ -2822,9 +2848,11 @@ mod test {
         assert_eq!(client.get_job(&job_id).status, JobStatus::Completed);
     }
 
+    /// A signer that is not a member of the committee is rejected with
+    /// Unauthorized (#2), even when paired with a legitimate member.
     #[test]
     #[should_panic(expected = "Error(Contract, #2)")]
-    fn resolve_dispute_non_admin_unauthorized() {
+    fn resolve_dispute_non_member_signer_unauthorized() {
         let (env, client, _, user, freelancer, native_token) = setup();
         let job_id = client.post_job(
             &user,
@@ -2837,29 +2865,253 @@ mod test {
         client.accept_job(&freelancer, &job_id);
         client.raise_dispute(&user, &job_id, &None, &None);
 
-        // Disable mock auths so the non-admin call actually fails
-        let env2 = Env::default();
-        let _ = env2; // env with mock_all_auths won't help here; use a fresh address
-                      // The contract uses admin.require_auth() — with mock_all_auths any address
-                      // passes require_auth, but the admin address stored is different from a
-                      // random caller. We test the guard by checking the admin address mismatch
-                      // causes the require_auth to be for the stored admin, not the random caller.
-                      // Since mock_all_auths is active we instead verify the InvalidStatus path
-                      // by calling on a non-disputed job.
-        let job_id2 = client.post_job(
-            &user,
+        let resolvers = client.get_dispute_resolvers();
+        let stranger = Address::generate(&env);
+        let signers = Vec::from_array(&env, [resolvers.get(0).unwrap(), stranger]);
+        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 }, &signers);
+    }
+
+    // ── Dispute resolution committee (issue #14) ────────────────────────────
+
+    /// Build a contract with no dispute committee configured and return a
+    /// disputed job id, for tests that exercise committee bootstrap/edge cases.
+    fn setup_without_committee() -> (Env, EscrowContractClient<'static>, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| {
+            li.timestamp = 1_710_000_000;
+        });
+        let contract_id = env.register_contract(None, EscrowContract);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let native_token_admin = Address::generate(&env);
+        let native_token = env
+            .register_stellar_asset_contract_v2(native_token_admin)
+            .address();
+        client.initialize(&admin, &native_token);
+        let user = Address::generate(&env);
+        let asset = token::StellarAssetClient::new(&env, &native_token);
+        asset.mint(&user, &10_000_000_000);
+        (env, client, admin, native_token)
+    }
+
+    /// Drive a job all the way to the Disputed state and return its id.
+    fn disputed_job(
+        env: &Env,
+        client: &EscrowContractClient<'static>,
+        user: &Address,
+        freelancer: &Address,
+        native_token: &Address,
+    ) -> u64 {
+        let job_id = client.post_job(
+            user,
             &1_000_000i128,
-            &hash(&env),
+            &hash(env),
             &32u32,
             &0u64,
-            &native_token,
+            native_token,
         );
-        // job_id2 is Open, not Disputed → InvalidStatus (#3), but we want Unauthorized (#2)
-        // So raise dispute then call with wrong admin via a separate env without mock_all_auths
-        let _ = job_id2;
-        // Simplest approach: call resolve_dispute on a non-disputed job to get InvalidStatus
-        // For Unauthorized we rely on the require_auth mechanism tested below.
-        panic!("Error(Contract, #2)"); // placeholder to satisfy should_panic
+        client.accept_job(freelancer, &job_id);
+        client.raise_dispute(user, &job_id, &None, &None);
+        job_id
+    }
+
+    /// Two distinct committee members co-signing resolves the dispute.
+    #[test]
+    fn resolve_dispute_two_of_two_resolution() {
+        let (env, client, _, user, freelancer, native_token) = setup();
+        let job_id = disputed_job(&env, &client, &user, &freelancer, &native_token);
+
+        let resolvers = client.get_dispute_resolvers();
+        assert_eq!(resolvers.len(), 2);
+        assert_eq!(client.get_dispute_resolver_threshold(), 2);
+
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 10_000 },
+            &resolvers,
+        );
+        assert_eq!(client.get_job(&job_id).status, JobStatus::Cancelled);
+    }
+
+    /// A single committee member is not enough to meet the 2-of-N threshold.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #26)")]
+    fn resolve_dispute_single_signer_rejected() {
+        let (env, client, _, user, freelancer, native_token) = setup();
+        let job_id = disputed_job(&env, &client, &user, &freelancer, &native_token);
+
+        let resolvers = client.get_dispute_resolvers();
+        let signers = Vec::from_array(&env, [resolvers.get(0).unwrap()]);
+        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 0 }, &signers);
+    }
+
+    /// The same member listed twice is counted once, so a single compromised
+    /// key still cannot reach the threshold on its own.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #26)")]
+    fn resolve_dispute_duplicate_signer_not_double_counted() {
+        let (env, client, _, user, freelancer, native_token) = setup();
+        let job_id = disputed_job(&env, &client, &user, &freelancer, &native_token);
+
+        let resolvers = client.get_dispute_resolvers();
+        let one = resolvers.get(0).unwrap();
+        let signers = Vec::from_array(&env, [one.clone(), one]);
+        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 0 }, &signers);
+    }
+
+    /// With auths cleared, even a full committee list cannot resolve: each
+    /// member must actually authorize the call.
+    #[test]
+    #[should_panic]
+    fn resolve_dispute_requires_real_member_auth() {
+        let (env, client, _, user, freelancer, native_token) = setup();
+        let job_id = disputed_job(&env, &client, &user, &freelancer, &native_token);
+        let resolvers = client.get_dispute_resolvers();
+        env.set_auths(&[]);
+        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 0 }, &resolvers);
+    }
+
+    /// Resolution is disabled entirely until a committee is bootstrapped.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #25)")]
+    fn resolve_dispute_without_committee_rejected() {
+        let (env, client, _admin, native_token) = setup_without_committee();
+        let user = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let asset = token::StellarAssetClient::new(&env, &native_token);
+        asset.mint(&user, &10_000_000_000);
+        let job_id = disputed_job(&env, &client, &user, &freelancer, &native_token);
+
+        let no_signers: Vec<Address> = Vec::new(&env);
+        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 0 }, &no_signers);
+    }
+
+    /// The committee can only be bootstrapped once; later changes go through
+    /// the timelock.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #10)")]
+    fn configure_dispute_resolvers_is_one_time() {
+        let (env, client, admin, _native_token) = setup_without_committee();
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        client.configure_dispute_resolvers(&admin, &Vec::from_array(&env, [a.clone(), b.clone()]));
+        // Second bootstrap attempt is rejected.
+        client.configure_dispute_resolvers(&admin, &Vec::from_array(&env, [a, b]));
+    }
+
+    /// A set too small to satisfy the threshold is rejected at bootstrap.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #27)")]
+    fn configure_dispute_resolvers_rejects_too_few_members() {
+        let (env, client, admin, _native_token) = setup_without_committee();
+        let only = Address::generate(&env);
+        client.configure_dispute_resolvers(&admin, &Vec::from_array(&env, [only]));
+    }
+
+    /// Duplicate members are rejected at bootstrap.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #27)")]
+    fn configure_dispute_resolvers_rejects_duplicates() {
+        let (env, client, admin, _native_token) = setup_without_committee();
+        let a = Address::generate(&env);
+        client.configure_dispute_resolvers(&admin, &Vec::from_array(&env, [a.clone(), a]));
+    }
+
+    /// Only the admin may bootstrap the committee.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn configure_dispute_resolvers_non_admin_rejected() {
+        let (env, client, _admin, _native_token) = setup_without_committee();
+        let stranger = Address::generate(&env);
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        client.configure_dispute_resolvers(&stranger, &Vec::from_array(&env, [a, b]));
+    }
+
+    /// The resolver set can be swapped through the timelock: the new members
+    /// can resolve, and the old members can no longer authorize alone.
+    #[test]
+    fn update_dispute_resolvers_via_timelock() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+        let old = client.get_dispute_resolvers();
+
+        let n1 = Address::generate(&env);
+        let n2 = Address::generate(&env);
+        let new_set = Vec::from_array(&env, [n1, n2]);
+        let op_id = client.propose_operation(
+            &admin,
+            &AdminOperation::SetDisputeResolvers(new_set.clone()),
+        );
+        env.ledger().with_mut(|li| {
+            li.timestamp = 1_710_000_000 + DEFAULT_TIMELOCK_DELAY + 1;
+        });
+        client.execute_operation(&op_id);
+        assert_eq!(client.get_dispute_resolvers(), new_set);
+
+        // The new committee resolves a dispute.
+        let job_id = disputed_job(&env, &client, &user, &freelancer, &native_token);
+        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 }, &new_set);
+        assert_eq!(client.get_job(&job_id).status, JobStatus::Cancelled);
+
+        // The old members are no longer authorized.
+        let job_id2 = disputed_job(&env, &client, &user, &freelancer, &native_token);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.resolve_dispute(&job_id2, &DisputeResolution { client_bps: 10_000 }, &old);
+        }));
+        assert!(result.is_err(), "old committee must no longer resolve");
+    }
+
+    /// The threshold can be raised through the timelock; afterwards a quorum of
+    /// the old size is insufficient.
+    #[test]
+    fn update_dispute_resolver_threshold_via_timelock() {
+        let (env, client, admin, user, freelancer, native_token) = setup();
+
+        // Grow the committee to three members first.
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let c = Address::generate(&env);
+        let three = Vec::from_array(&env, [a, b, c]);
+        let op_members =
+            client.propose_operation(&admin, &AdminOperation::SetDisputeResolvers(three.clone()));
+        let op_threshold =
+            client.propose_operation(&admin, &AdminOperation::SetDisputeResolverThreshold(3u32));
+        env.ledger().with_mut(|li| {
+            li.timestamp = 1_710_000_000 + DEFAULT_TIMELOCK_DELAY + 1;
+        });
+        client.execute_operation(&op_members);
+        client.execute_operation(&op_threshold);
+        assert_eq!(client.get_dispute_resolver_threshold(), 3);
+
+        // Two of three is now insufficient.
+        let job_id = disputed_job(&env, &client, &user, &freelancer, &native_token);
+        let two = Vec::from_array(&env, [three.get(0).unwrap(), three.get(1).unwrap()]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 }, &two);
+        }));
+        assert!(
+            result.is_err(),
+            "2-of-3 must be rejected after raising threshold"
+        );
+
+        // All three resolve.
+        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 }, &three);
+        assert_eq!(client.get_job(&job_id).status, JobStatus::Cancelled);
+    }
+
+    /// A threshold larger than the current member count cannot be set.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #27)")]
+    fn raise_threshold_above_member_count_rejected() {
+        let (env, client, admin, _, _, _) = setup();
+        // Default committee has two members; requiring three is invalid.
+        let op_id =
+            client.propose_operation(&admin, &AdminOperation::SetDisputeResolverThreshold(3u32));
+        env.ledger().with_mut(|li| {
+            li.timestamp = 1_710_000_000 + DEFAULT_TIMELOCK_DELAY + 1;
+        });
+        client.execute_operation(&op_id);
     }
 
     #[test]
@@ -2875,7 +3127,11 @@ mod test {
             &0u64,
             &native_token,
         );
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 10_000 },
+            &client.get_dispute_resolvers(),
+        );
     }
 
     #[test]
@@ -2892,7 +3148,11 @@ mod test {
         );
         client.accept_job(&freelancer, &job_id);
         // InProgress, not Disputed
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 0 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 0 },
+            &client.get_dispute_resolvers(),
+        );
     }
 
     #[test]
@@ -2910,7 +3170,11 @@ mod test {
         client.raise_dispute(&user, &job_id, &None, &None);
 
         // freelancer wins entirely
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 0 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 0 },
+            &client.get_dispute_resolvers(),
+        );
 
         // fee = 2.5% of 2_000_000 = 50_000
         assert_eq!(client.get_fees(&native_token), 50_000);
@@ -2936,7 +3200,11 @@ mod test {
         );
         client.accept_job(&freelancer, &job_id);
         client.raise_dispute(&user, &job_id, &None, &None);
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 5_000 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 5_000 },
+            &client.get_dispute_resolvers(),
+        );
 
         let events = env.events().all();
         assert!(events.len() >= 4); // created, accepted, disputed, resolved
@@ -3259,7 +3527,11 @@ mod test {
         );
         client.accept_job(&freelancer, &job_id);
         client.raise_dispute(&user, &job_id, &None, &None);
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 0 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 0 },
+            &client.get_dispute_resolvers(),
+        );
         assert_eq!(client.get_completed_jobs_count(), 1);
     }
 
@@ -3360,7 +3632,11 @@ mod test {
         );
         client.accept_job(&freelancer, &job_id3);
         client.raise_dispute(&user, &job_id3, &None, &None);
-        client.resolve_dispute(&job_id3, &DisputeResolution { client_bps: 10_000 });
+        client.resolve_dispute(
+            &job_id3,
+            &DisputeResolution { client_bps: 10_000 },
+            &client.get_dispute_resolvers(),
+        );
         assert_eq!(client.get_cancelled_jobs_count(), 3);
     }
 
@@ -3402,7 +3678,11 @@ mod test {
         client.raise_dispute(&user, &job_id, &None, &None);
 
         assert_eq!(client.get_cancelled_jobs_count(), 0);
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 10_000 },
+            &client.get_dispute_resolvers(),
+        );
         assert_eq!(client.get_cancelled_jobs_count(), 1);
     }
 
@@ -3501,14 +3781,22 @@ mod test {
         // Complete j3 via dispute resolution (freelancer wins)
         client.accept_job(&freelancer, &j3);
         client.raise_dispute(&user, &j3, &None, &None);
-        client.resolve_dispute(&j3, &DisputeResolution { client_bps: 0 });
+        client.resolve_dispute(
+            &j3,
+            &DisputeResolution { client_bps: 0 },
+            &client.get_dispute_resolvers(),
+        );
         assert_eq!(client.get_completed_jobs_count(), 2);
         assert_eq!(client.get_cancelled_jobs_count(), 1);
 
         // Cancel j4 via dispute resolution (client wins)
         client.accept_job(&freelancer, &j4);
         client.raise_dispute(&user, &j4, &None, &None);
-        client.resolve_dispute(&j4, &DisputeResolution { client_bps: 10_000 });
+        client.resolve_dispute(
+            &j4,
+            &DisputeResolution { client_bps: 10_000 },
+            &client.get_dispute_resolvers(),
+        );
         assert_eq!(client.get_completed_jobs_count(), 2);
         assert_eq!(client.get_cancelled_jobs_count(), 2);
     }
@@ -3635,7 +3923,13 @@ mod test {
             expect_panic_with_contract_error(|| client.reject_work(&user, &job_id), 3);
             expect_panic_with_contract_error(|| client.enforce_deadline(&user, &job_id), 3);
             expect_panic_with_contract_error(
-                || client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 }),
+                || {
+                    client.resolve_dispute(
+                        &job_id,
+                        &DisputeResolution { client_bps: 10_000 },
+                        &client.get_dispute_resolvers(),
+                    )
+                },
                 3,
             );
         }
@@ -3708,7 +4002,13 @@ mod test {
             expect_panic_with_contract_error(|| client.reject_work(&user, &job_id), 3);
             expect_panic_with_contract_error(|| client.cancel_job(&user, &job_id), 3);
             expect_panic_with_contract_error(
-                || client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 }),
+                || {
+                    client.resolve_dispute(
+                        &job_id,
+                        &DisputeResolution { client_bps: 10_000 },
+                        &client.get_dispute_resolvers(),
+                    )
+                },
                 3,
             );
         }
@@ -3777,7 +4077,13 @@ mod test {
             expect_panic_with_contract_error(|| client.cancel_job(&user, &job_id), 3);
             expect_panic_with_contract_error(|| client.enforce_deadline(&user, &job_id), 3);
             expect_panic_with_contract_error(
-                || client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 }),
+                || {
+                    client.resolve_dispute(
+                        &job_id,
+                        &DisputeResolution { client_bps: 10_000 },
+                        &client.get_dispute_resolvers(),
+                    )
+                },
                 3,
             );
         }
@@ -3807,7 +4113,13 @@ mod test {
                 3,
             );
             expect_panic_with_contract_error(
-                || client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 }),
+                || {
+                    client.resolve_dispute(
+                        &job_id,
+                        &DisputeResolution { client_bps: 10_000 },
+                        &client.get_dispute_resolvers(),
+                    )
+                },
                 3,
             );
         }
@@ -3835,7 +4147,13 @@ mod test {
                 3,
             );
             expect_panic_with_contract_error(
-                || client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 }),
+                || {
+                    client.resolve_dispute(
+                        &job_id,
+                        &DisputeResolution { client_bps: 10_000 },
+                        &client.get_dispute_resolvers(),
+                    )
+                },
                 3,
             );
         }
@@ -3853,7 +4171,11 @@ mod test {
             );
             client.accept_job(&freelancer, &job_id);
             client.raise_dispute(&user, &job_id, &None, &None);
-            client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 0 });
+            client.resolve_dispute(
+                &job_id,
+                &DisputeResolution { client_bps: 0 },
+                &client.get_dispute_resolvers(),
+            );
             assert_eq!(client.get_job(&job_id).status, JobStatus::Completed);
         }
         {
@@ -3868,7 +4190,11 @@ mod test {
             );
             client.accept_job(&freelancer, &job_id);
             client.raise_dispute(&freelancer, &job_id, &None, &None);
-            client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 });
+            client.resolve_dispute(
+                &job_id,
+                &DisputeResolution { client_bps: 10_000 },
+                &client.get_dispute_resolvers(),
+            );
             assert_eq!(client.get_job(&job_id).status, JobStatus::Cancelled);
         }
 
@@ -3998,7 +4324,11 @@ mod test {
         client.raise_dispute(&user, &job_id, &None, &None);
 
         let pre_freelancer = token_client.balance(&freelancer);
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 0 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 0 },
+            &client.get_dispute_resolvers(),
+        );
         let post_freelancer = token_client.balance(&freelancer);
 
         let payout = post_freelancer - pre_freelancer;
@@ -5115,7 +5445,11 @@ mod test {
         client.accept_job(&freelancer, &job_id);
         client.submit_work(&freelancer, &job_id);
         // SubmittedForReview is not Disputed — must panic.
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 5_000 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 5_000 },
+            &client.get_dispute_resolvers(),
+        );
     }
 
     /// resolve_dispute on a Completed job must panic.
@@ -5135,7 +5469,11 @@ mod test {
         client.submit_work(&freelancer, &job_id);
         client.approve_work(&user, &job_id);
         // Completed jobs are final — must panic.
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 5_000 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 5_000 },
+            &client.get_dispute_resolvers(),
+        );
     }
 
     /// resolve_dispute on a Cancelled job must panic.
@@ -5153,7 +5491,11 @@ mod test {
         );
         client.cancel_job(&user, &job_id);
         // Cancelled jobs are final — must panic.
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 5_000 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 5_000 },
+            &client.get_dispute_resolvers(),
+        );
     }
 
     /// After a failed resolve_dispute call, no token transfers occur and the
@@ -5179,7 +5521,11 @@ mod test {
 
         // Attempt resolve_dispute on Open job — must panic
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 5_000 });
+            client.resolve_dispute(
+                &job_id,
+                &DisputeResolution { client_bps: 5_000 },
+                &client.get_dispute_resolvers(),
+            );
         }));
         assert!(
             result.is_err(),
@@ -6538,7 +6884,11 @@ mod test {
         let evidence_hash = BytesN::from_array(&env, &[3u8; 32]);
         client.raise_dispute(&user, &job_id, &Some(evidence_hash.clone()), &None);
 
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 5_000 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 5_000 },
+            &client.get_dispute_resolvers(),
+        );
 
         let evidence = client.get_dispute_evidence(&job_id);
         assert!(evidence.is_some());
@@ -6832,7 +7182,11 @@ mod test {
         let evidence_hash = BytesN::from_array(&env, &[3u8; 32]);
         client.raise_dispute(&user, &job_id, &Some(evidence_hash.clone()), &None);
 
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 5_000 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 5_000 },
+            &client.get_dispute_resolvers(),
+        );
 
         let evidence = client.get_dispute_evidence(&job_id);
         assert!(evidence.is_some());
@@ -7423,7 +7777,11 @@ mod test {
         client.accept_job(&freelancer, &job_id);
         client.raise_dispute(&user, &job_id, &None, &None);
         client.pause(&admin);
-        client.resolve_dispute(&job_id, &DisputeResolution { client_bps: 10_000 });
+        client.resolve_dispute(
+            &job_id,
+            &DisputeResolution { client_bps: 10_000 },
+            &client.get_dispute_resolvers(),
+        );
         assert_eq!(token_client.balance(&user), pre_balance);
         assert_eq!(client.get_job(&job_id).status, JobStatus::Cancelled);
     }

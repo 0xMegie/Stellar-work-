@@ -70,6 +70,9 @@ pub enum AdminOperation {
     // Storage cost management (issue #15)
     SetStorageDepositRate(i128),
     SetTtlBumpFee(i128),
+    // Dispute resolution committee (issue #14)
+    SetDisputeResolvers(Vec<Address>),
+    SetDisputeResolverThreshold(u32),
 }
 
 #[contracttype]
@@ -1650,6 +1653,30 @@ fn apply_operation(e: &Env, operation: &AdminOperation) {
             e.storage().instance().set(&DataKey::TtlBumpFee, &f);
             e.events()
                 .publish((Symbol::new(e, "ttl_bump_fee_updated"),), (f,));
+        }
+        AdminOperation::SetDisputeResolvers(resolvers) => {
+            // Keep the existing threshold; the new set must still satisfy it.
+            let threshold = get_dispute_resolver_threshold_storage(e);
+            validate_resolver_set(e, resolvers, threshold);
+            store_dispute_resolvers(e, resolvers);
+            e.events().publish(
+                (Symbol::new(e, "dispute_resolvers_updated"),),
+                (resolvers.len(), threshold),
+            );
+        }
+        AdminOperation::SetDisputeResolverThreshold(threshold) => {
+            let t = *threshold;
+            // Validate the new threshold against the current resolver set so we
+            // can never require more signatures than there are members.
+            let resolvers = get_dispute_resolvers_storage(e);
+            validate_resolver_set(e, &resolvers, t);
+            e.storage()
+                .instance()
+                .set(&DataKey::DisputeResolverThreshold, &t);
+            e.events().publish(
+                (Symbol::new(e, "dispute_resolver_threshold_updated"),),
+                (t,),
+            );
         }
     }
 }

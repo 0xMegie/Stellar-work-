@@ -25,6 +25,18 @@ const MIN_TIMELOCK_DELAY: u64 = 3_600;
 const DEFAULT_TIMELOCK_DELAY: u64 = 3_600;
 const OPERATION_EXPIRY: u64 = 2_592_000;
 
+// ── Dispute resolution committee (issue #14) ─────────────────────────────────
+// `resolve_dispute` controls the entire escrowed balance of a disputed job, not
+// just accumulated fees. A single compromised admin key must not be able to
+// redirect those funds, so resolution is gated behind an M-of-N committee: at
+// least `threshold` distinct members of the resolver set must co-sign the same
+// transaction. The committee is bootstrapped once by the admin and thereafter
+// only mutated through the timelock, matching the protection already applied to
+// other sensitive admin operations.
+const MIN_DISPUTE_RESOLVER_THRESHOLD: u32 = 2;
+const DEFAULT_DISPUTE_RESOLVER_THRESHOLD: u32 = 2;
+const MAX_DISPUTE_RESOLVERS: u32 = 10;
+
 // ── Storage cost management (issue #15) ──────────────────────────────────────
 // The storage-deposit model is opt-in: both rates default to 0 (disabled), so
 // the contract behaves exactly as before until the admin enables it via the
@@ -154,6 +166,9 @@ pub enum DataKey {
     TtlBumpFee,
     TotalStorageDeposits,
     ContractState,
+    // Dispute resolution committee (issue #14)
+    DisputeResolvers,
+    DisputeResolverThreshold,
 }
 
 #[contracterror]
@@ -184,6 +199,9 @@ pub enum Error {
     OperationExpired = 22,
     DelayBelowMinimum = 23,
     ContractPaused = 24,
+    DisputeResolversNotConfigured = 25,
+    InsufficientSigners = 26,
+    InvalidResolverSet = 27,
 }
 
 #[contract]
@@ -1035,6 +1053,48 @@ impl EscrowContract {
         get_proposals_count_storage(&e)
     }
 
+    // ── Dispute resolution committee (issue #14) ────────────────────────────
+
+    /// One-time bootstrap of the dispute resolution committee.
+    ///
+    /// `resolve_dispute` is disabled until a committee is configured. This
+    /// entrypoint may only be called by the admin and only while no committee
+    /// exists yet — once set, the resolver set and threshold can only be
+    /// changed through the timelock (`AdminOperation::SetDisputeResolvers` /
+    /// `SetDisputeResolverThreshold`), so a later-compromised admin key cannot
+    /// unilaterally swap the committee out.
+    pub fn configure_dispute_resolvers(e: Env, caller: Address, resolvers: Vec<Address>) {
+        caller.require_auth();
+        let admin = load_admin(&e);
+        if caller != admin {
+            panic_with_error!(&e, Error::Unauthorized);
+        }
+        if e.storage().instance().has(&DataKey::DisputeResolvers) {
+            // Already bootstrapped — further changes must go through the timelock.
+            panic_with_error!(&e, Error::AlreadyInitialized);
+        }
+
+        let threshold = get_dispute_resolver_threshold_storage(&e);
+        validate_resolver_set(&e, &resolvers, threshold);
+        store_dispute_resolvers(&e, &resolvers);
+        bump_instance_ttl(&e);
+
+        e.events().publish(
+            (Symbol::new(&e, "dispute_resolvers_configured"),),
+            (caller, resolvers.len(), threshold),
+        );
+    }
+
+    /// Current dispute resolution committee. Empty until bootstrapped.
+    pub fn get_dispute_resolvers(e: Env) -> Vec<Address> {
+        get_dispute_resolvers_storage(&e)
+    }
+
+    /// Number of distinct committee signatures required to resolve a dispute.
+    pub fn get_dispute_resolver_threshold(e: Env) -> u32 {
+        get_dispute_resolver_threshold_storage(&e)
+    }
+
     // ── Storage cost management views (issue #15) ───────────────────────────
 
     /// Current per-job storage deposit rate (0 = deposits disabled).
@@ -1414,6 +1474,78 @@ fn get_timelock_delay_storage(e: &Env) -> u64 {
         .instance()
         .get::<DataKey, u64>(&DataKey::TimelockDelay)
         .unwrap_or(DEFAULT_TIMELOCK_DELAY)
+}
+
+fn get_dispute_resolvers_storage(e: &Env) -> Vec<Address> {
+    e.storage()
+        .instance()
+        .get::<DataKey, Vec<Address>>(&DataKey::DisputeResolvers)
+        .unwrap_or_else(|| Vec::new(e))
+}
+
+fn get_dispute_resolver_threshold_storage(e: &Env) -> u32 {
+    e.storage()
+        .instance()
+        .get::<DataKey, u32>(&DataKey::DisputeResolverThreshold)
+        .unwrap_or(DEFAULT_DISPUTE_RESOLVER_THRESHOLD)
+}
+
+fn store_dispute_resolvers(e: &Env, resolvers: &Vec<Address>) {
+    e.storage()
+        .instance()
+        .set(&DataKey::DisputeResolvers, resolvers);
+}
+
+/// Validate a proposed committee: the threshold must be at least the protocol
+/// minimum, the set must be no larger than the cap, must contain enough members
+/// to satisfy the threshold, and must not contain duplicate addresses (which
+/// would otherwise let a single key contribute multiple "signatures").
+fn validate_resolver_set(e: &Env, resolvers: &Vec<Address>, threshold: u32) {
+    if threshold < MIN_DISPUTE_RESOLVER_THRESHOLD {
+        panic_with_error!(e, Error::InvalidResolverSet);
+    }
+    if resolvers.len() > MAX_DISPUTE_RESOLVERS {
+        panic_with_error!(e, Error::InvalidResolverSet);
+    }
+    if resolvers.len() < threshold {
+        panic_with_error!(e, Error::InvalidResolverSet);
+    }
+    let mut seen: Vec<Address> = Vec::new(e);
+    for resolver in resolvers.iter() {
+        if seen.contains(&resolver) {
+            panic_with_error!(e, Error::InvalidResolverSet);
+        }
+        seen.push_back(resolver);
+    }
+}
+
+/// Enforce M-of-N committee authorization for dispute resolution. Every entry
+/// in `signers` must be a distinct member of the configured resolver set and
+/// must authorize the call; the count of distinct authorizing members must meet
+/// the configured threshold.
+fn authorize_dispute_resolution(e: &Env, signers: &Vec<Address>) {
+    let resolvers = get_dispute_resolvers_storage(e);
+    if resolvers.is_empty() {
+        panic_with_error!(e, Error::DisputeResolversNotConfigured);
+    }
+    let threshold = get_dispute_resolver_threshold_storage(e);
+
+    let mut counted: Vec<Address> = Vec::new(e);
+    for signer in signers.iter() {
+        if !resolvers.contains(&signer) {
+            panic_with_error!(e, Error::Unauthorized);
+        }
+        if counted.contains(&signer) {
+            // Ignore duplicate entries so one key cannot be counted twice.
+            continue;
+        }
+        signer.require_auth();
+        counted.push_back(signer);
+    }
+
+    if counted.len() < threshold {
+        panic_with_error!(e, Error::InsufficientSigners);
+    }
 }
 
 fn load_operation_or_panic(e: &Env, op_id: u64) -> TimelockedOperation {

@@ -609,10 +609,11 @@ impl EscrowContract {
 
     /// Resolve a disputed job.
     ///
-    /// Only the admin may call this.  `resolution.client_bps` is the share
-    /// (in basis-points, 0 – 10 000) of the escrowed amount returned to the
-    /// client.  The remainder is paid to the freelancer after deducting the
-    /// platform fee.
+    /// Requires at least `threshold` distinct members of the dispute resolution
+    /// committee to co-sign (see `configure_dispute_resolvers`); `signers` lists
+    /// the authorizing members.  `resolution.client_bps` is the share (in
+    /// basis-points, 0 – 10 000) of the escrowed amount returned to the client.
+    /// The remainder is paid to the freelancer after deducting the platform fee.
     ///
     /// Special cases:
     ///   client_bps == 10_000  → full refund to client, no fee, status = Cancelled
@@ -620,9 +621,16 @@ impl EscrowContract {
     ///   0 < client_bps < 10_000 → split: client gets their share (no fee on
     ///                             client portion), freelancer gets remainder
     ///                             minus platform fee, status = Completed
-    pub fn resolve_dispute(e: Env, job_id: u64, resolution: DisputeResolution) {
-        let admin = load_admin(&e);
-        admin.require_auth();
+    pub fn resolve_dispute(
+        e: Env,
+        job_id: u64,
+        resolution: DisputeResolution,
+        signers: Vec<Address>,
+    ) {
+        // Gated behind the dispute resolution committee (issue #14): at least
+        // `threshold` distinct committee members must co-sign this call. A
+        // single key — even the admin's — can no longer redirect escrowed funds.
+        authorize_dispute_resolution(&e, &signers);
 
         let mut job = get_job_or_panic(&e, job_id);
         if job.status != JobStatus::Disputed {
